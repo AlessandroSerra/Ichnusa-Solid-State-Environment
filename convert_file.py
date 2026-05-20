@@ -87,6 +87,14 @@ def convert(args, infile_type, outfile_type):
     elif "alm.lmp" in outfile_type:
         _write_lammps_alamode(ase_cell, args.output)
 
+    elif "extxyz" in outfile_type:
+        write(
+            args.output,
+            ase_cell,
+            format=outfile_type,
+            columns=["symbols", "positions", "masses"],
+        )
+
     else:
         write(args.output, ase_cell, format=outfile_type)
 
