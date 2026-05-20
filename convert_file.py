@@ -98,6 +98,9 @@ def convert(args, infile_type, outfile_type):
         supercell.wrap(eps=1e-12)
         ase_cell = supercell
 
+    if outfile_type in ("vasp", "poscar"):  # sort BEFORE writing
+        ase_cell = sort(ase_cell)
+
     if "lammps-data" in outfile_type:
         write_lammps_data(args.output, ase_cell, masses=True)
 
@@ -111,8 +114,6 @@ def convert(args, infile_type, outfile_type):
             format=outfile_type,
             columns=["symbols", "positions", "masses"],
         )
-    if outfile_type in ("vasp", "poscar"):
-        ase_cell = sort(ase_cell)
 
     else:
         write(args.output, ase_cell, format=outfile_type)
