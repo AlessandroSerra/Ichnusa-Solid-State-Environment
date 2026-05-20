@@ -83,6 +83,7 @@ def convert(args, infile_type, outfile_type):
 
     if "lammps-data" in outfile_type:
         write_lammps_data(args.output, ase_cell, masses=True)
+        return
 
     if "alm.lmp" in outfile_type:
         _write_lammps_alamode(ase_cell, args.output)
