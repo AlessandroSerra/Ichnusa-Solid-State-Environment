@@ -63,8 +63,8 @@ def _write_lammps_alamode(ase_cell, outfile) -> None:
         )
         f.write("ITEM: ATOMS id xu yu zu fx fy fz\n")
 
-        for idx in range(1, Natoms + 1):
-            f.write(f"{idx}\t")
+        for idx in range(Natoms):
+            f.write(f"{idx + 1}\t")
             f.write(
                 f"{positions[idx][0]:.16f}\t{positions[idx][1]:.16f}\t{positions[idx][2]:.16f}\t"
             )
