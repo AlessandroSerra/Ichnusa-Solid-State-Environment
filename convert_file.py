@@ -75,19 +75,19 @@ def _write_lammps_alamode(ase_cell, outfile) -> None:
 def convert(args, infile_type, outfile_type):
     ase_cell = read(args.input, format=infile_type)
 
-    if "alm.lmp" in outfile_type:
-        _write_lammps_alamode(ase_cell, args.output)
-        return
-
     if args.replicate:
         nx, ny, nz = args.replicate
         supercell = ase_cell.repeat([nx, ny, nz])
         supercell.wrap(eps=1e-12)
-        write(args.output, supercell, format=outfile_type)
-        return
+        ase_cell = supercell
 
     if "lammps-data" in outfile_type:
         write_lammps_data(args.output, ase_cell, masses=True)
+        return
+
+    if "alm.lmp" in outfile_type:
+        _write_lammps_alamode(ase_cell, args.output)
+        return
 
     write(args.output, ase_cell, format=outfile_type)
 
