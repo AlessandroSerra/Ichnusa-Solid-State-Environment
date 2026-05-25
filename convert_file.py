@@ -257,12 +257,48 @@ def _check_kabsch(a1: Atoms, a2: Atoms, tol: float = 1e-4) -> bool:
         return False
 
 
-def _check_fractional(a1: Atoms, a2: Atoms, tol: float = 1e-3) -> bool:
+def _check_fractional(a1: Atoms, a2: Atoms, tol: float = 1e-3) -> tuple[bool, float]:
+    """
+    Check fractional coordinate equivalence, species by species.
+
+    Uses KDTree nearest-neighbor matching (PBC-aware) instead of lexsort,
+    which is fragile for near-degenerate positions in relaxed structures.
+    For each atom of species Z in a1, finds the closest Z atom in a2
+    (minimum-image distance in fractional coords).  Requires scipy.
+
+    Returns (ok, max_dist).
+    """
+    try:
+        from scipy.spatial import KDTree
+    except ImportError:
+        raise RuntimeError(
+            "scipy is required for the fractional-coordinate check. "
+            "Install it with: pip install scipy"
+        )
+
     s1 = a1.get_scaled_positions() % 1.0
     s2 = a2.get_scaled_positions() % 1.0
-    s1 = s1[np.lexsort(s1.T[::-1])]
-    s2 = s2[np.lexsort(s2.T[::-1])]
-    return np.allclose(s1, s2, atol=tol)
+    box = np.ones(3)  # fractional coords live in [0, 1)^3
+
+    max_dist = 0.0
+    for Z in sorted(set(a1.numbers)):
+        m1 = a1.numbers == Z
+        m2 = a2.numbers == Z
+        if m1.sum() != m2.sum():
+            return (
+                False,
+                1.0,
+            )  # species count mismatch → caught earlier, but just in case
+
+        p1, p2 = s1[m1], s2[m2]
+        # boxsize enables PBC wrapping in the distance query
+        tree = KDTree(p2, boxsize=box)
+        dists, _ = tree.query(p1)
+        species_max = float(dists.max())
+        if species_max > max_dist:
+            max_dist = species_max
+
+    return max_dist < tol, max_dist
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,8 +445,9 @@ def run_equivalence_tests(
     # 6 ── Fractional coordinates ─────────────────────────────────────────────
     label = "Fractional coords (PBC-wrapped, sorted)"
     try:
-        ok = _check_fractional(ref, conv)
-        _result_line(label, PASS if ok else FAIL)
+        ok, max_diff = _check_fractional(ref, conv)
+        detail = f"max Δ = {max_diff:.2e}"
+        _result_line(label, PASS if ok else FAIL, detail)
         record(PASS if ok else FAIL)
     except Exception as e:
         _result_line(label, SKIP, str(e))
