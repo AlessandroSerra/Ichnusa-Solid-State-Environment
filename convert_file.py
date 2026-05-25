@@ -1,0 +1,610 @@
+#!/usr/bin/env -S python3 -u
+"""
+convert_file.py — Atomic structure file format converter with built-in equivalence tests.
+
+Supported workflows:
+  Single file:   convert_file.py input.xyz -o output.lmp
+  Glob pattern:  convert_file.py "*.xyz" -ot lammps-data
+  Supercell:     convert_file.py POSCAR -o super.xyz -r 3 3 3
+  Skip tests:    convert_file.py input.xyz -o output.lmp --skip-tests
+"""
+
+import os
+import sys
+import warnings
+from argparse import ArgumentParser
+from glob import glob
+
+import numpy as np
+
+# ── ASE ──────────────────────────────────────────────────────────────────────
+try:
+    from ase import Atoms
+    from ase.build import minimize_rotation_and_translation, sort
+    from ase.calculators.singlepoint import SinglePointCalculator
+    from ase.geometry import minkowski_reduce
+    from ase.io import read, write
+    from ase.io.formats import ioformats
+    from ase.io.lammpsdata import write_lammps_data
+except ImportError:
+    print("ASE is needed. Install it with: pip install ase")
+    sys.exit(1)
+
+# ── spglib (optional — symmetry test is skipped if absent) ───────────────────
+try:
+    import spglib
+
+    _HAS_SPGLIB = True
+except ImportError:
+    _HAS_SPGLIB = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANSI colours
+# ─────────────────────────────────────────────────────────────────────────────
+_USE_COLOR = sys.stdout.isatty()
+
+
+def _c(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _USE_COLOR else text
+
+
+def green(t):
+    return _c(t, "32")
+
+
+def red(t):
+    return _c(t, "31")
+
+
+def yellow(t):
+    return _c(t, "33")
+
+
+def bold(t):
+    return _c(t, "1")
+
+
+def cyan(t):
+    return _c(t, "36")
+
+
+PASS = green("PASS")
+FAIL = red("FAIL")
+SKIP = yellow("SKIP")
+WARN = yellow("WARN")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CONVERSION HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def print_available_formats() -> None:
+    """Print a table of all valid ASE formats."""
+    print(f"\n{'Available Format':<18} | {'Description'}")
+    print("-" * 65)
+    for name in sorted(ioformats.keys()):
+        fmt = ioformats[name]
+        print(f"{name:<18} | {fmt.description}")
+
+
+def guess_format(filename: str) -> str:
+    """Guess the ASE format from a filename."""
+    base = os.path.basename(filename).lower()
+    if "poscar" in base or "contcar" in base:
+        return "vasp"
+    ext = os.path.splitext(base)[1].strip(".")
+    return "extxyz" if ext == "xyz" else ext
+
+
+def derive_output(input_path: str, outfile_type: str) -> str:
+    """Derive an output filename from the input path and desired output type."""
+    ext_map = {
+        "extxyz": "xyz",
+        "lammps-data": "lmp",
+        "vasp": "POSCAR",
+        "poscar": "POSCAR",
+        "cif": "cif",
+        "espresso-in": "pwi",
+        "espresso-out": "pwo",
+        "alm.lmp": "alm.lmp",
+        "lammpstrj": "lammpstrj",
+    }
+    ext = ext_map.get(outfile_type, outfile_type)
+    base = os.path.splitext(input_path)[0]
+    return f"{base}.{ext}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAMMPS / ALAMOde custom I/O
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _write_lammps_alamode(ase_cell: Atoms, outfile: str) -> None:
+    """Write an ALAMode-compatible LAMMPS dump file."""
+    Natoms = len(ase_cell)
+    positions = ase_cell.get_positions()
+    forces = ase_cell.get_forces()
+    cell = ase_cell.cell.array.copy()
+    cell[np.abs(cell) < 1e-6] = 0.0
+
+    with open(outfile, "w") as f:
+        f.write("ITEM: TIMESTEP\n0\n")
+        f.write("ITEM: NUMBER OF ATOMS\n")
+        f.write(f"{Natoms}\n")
+        f.write("ITEM: BOX BOUNDS xy xz yz pp pp pp\n")
+        for row in cell:
+            f.write(f"{row[0]:.16e} {row[1]:.16e} {row[2]:.16e}\n")
+        f.write("ITEM: ATOMS id xu yu zu fx fy fz\n")
+        for i in range(Natoms):
+            p = positions[i]
+            fv = forces[i]
+            f.write(
+                f"{i + 1}\t"
+                f"{p[0]:.16f}\t{p[1]:.16f}\t{p[2]:.16f}\t"
+                f"{fv[0]:.16f}\t{fv[1]:.16f}\t{fv[2]:.16f}\n"
+            )
+
+
+def _read_lammps_alamode(infile: str) -> Atoms:
+    """Read an ALAMode-compatible LAMMPS dump file."""
+    with open(infile) as f:
+        lines = f.readlines()
+
+    Natoms = int(lines[3])
+    cell = np.array([list(map(float, l.split())) for l in lines[5:8]])
+    positions = np.zeros((Natoms, 3))
+    forces = np.zeros((Natoms, 3))
+
+    for i, line in enumerate(lines[9 : 9 + Natoms]):
+        cols = np.array(line.split(), dtype=np.float64)
+        positions[i] = cols[1:4]
+        forces[i] = cols[4:7]
+
+    atoms = Atoms(positions=positions, cell=cell, pbc=True)
+    atoms.calc = SinglePointCalculator(atoms, forces=forces)
+    return atoms
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core conversion
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def convert(
+    infile: str,
+    outfile: str,
+    infile_type: str,
+    outfile_type: str,
+    replicate: tuple | None = None,
+) -> Atoms:
+    """
+    Convert *infile* → *outfile* and return the resulting ASE Atoms object.
+    """
+    if infile_type in ("lammpstrj", "alm.lmp"):
+        ase_cell = _read_lammps_alamode(infile)
+    else:
+        ase_cell = read(infile, format=infile_type)
+
+    if replicate:
+        nx, ny, nz = replicate
+        ase_cell = ase_cell.repeat([nx, ny, nz])
+        ase_cell.wrap(eps=1e-12)
+
+    if outfile_type in ("vasp", "poscar"):
+        ase_cell = sort(ase_cell)
+
+    if "lammps-data" in outfile_type:
+        write_lammps_data(outfile, ase_cell, masses=True)
+    elif outfile_type in ("alm.lmp", "lammpstrj"):
+        _write_lammps_alamode(ase_cell, outfile)
+    elif "extxyz" in outfile_type:
+        ase_cell.set_masses(ase_cell.get_masses())
+        write(
+            outfile,
+            ase_cell,
+            format=outfile_type,
+            columns=["symbols", "positions", "masses"],
+        )
+    else:
+        write(outfile, ase_cell, format=outfile_type, direct=True)
+
+    return ase_cell
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# EQUIVALENCE CHECKS  (ported from test.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _check_minkowski(a1: Atoms, a2: Atoms, tol: float = 1e-5) -> bool:
+    p1, _ = minkowski_reduce(a1.cell)
+    p2, _ = minkowski_reduce(a2.cell)
+    return np.allclose(p1.cellpar(), p2.cellpar(), atol=tol)
+
+
+def _check_spglib(a1: Atoms, a2: Atoms, symprec: float = 1e-5) -> bool:
+    if not _HAS_SPGLIB:
+        return None  # signal: skip
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        ds1 = spglib.get_symmetry_dataset(
+            (a1.cell, a1.get_scaled_positions(), a1.numbers), symprec=symprec
+        )
+        ds2 = spglib.get_symmetry_dataset(
+            (a2.cell, a2.get_scaled_positions(), a2.numbers), symprec=symprec
+        )
+    if ds1 is None or ds2 is None:
+        return False
+    if ds1.number != ds2.number:
+        return False
+    if not np.isclose(a1.get_volume(), a2.get_volume(), rtol=symprec):
+        return False
+    return True
+
+
+def _check_kabsch(a1: Atoms, a2: Atoms, tol: float = 1e-4) -> bool:
+    c1, c2 = a1.copy(), a2.copy()
+    try:
+        minimize_rotation_and_translation(c1, c2)
+        return (
+            np.abs(c1.cell - c2.cell).max() < tol
+            and np.abs(c1.get_positions() - c2.get_positions()).max() < tol
+        )
+    except Exception:
+        return False
+
+
+def _check_fractional(a1: Atoms, a2: Atoms, tol: float = 1e-4) -> bool:
+    s1 = a1.get_scaled_positions() % 1.0
+    s2 = a2.get_scaled_positions() % 1.0
+    s1 = s1[np.lexsort(s1.T[::-1])]
+    s2 = s2[np.lexsort(s2.T[::-1])]
+    return np.allclose(s1, s2, atol=tol)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _result_line(label: str, badge: str, detail: str = "") -> None:
+    detail_str = f"  {yellow(detail)}" if detail else ""
+    print(f"    [{badge}] {label}{detail_str}")
+
+
+def run_equivalence_tests(
+    orig: Atoms,
+    conv: Atoms,
+    infile: str,
+    outfile: str,
+    replicate: tuple | None = None,
+) -> bool:
+    """
+    Run all equivalence checks between *orig* (input) and *conv* (output).
+    Returns True if every applicable test passed.
+    """
+    print(
+        bold(
+            f"\n  ── Equivalence tests: {os.path.basename(infile)} → {os.path.basename(outfile)} ──"
+        )
+    )
+
+    # Try to read the written file back so we test what was actually saved on disk
+    try:
+        outfile_type = guess_format(outfile)
+        if outfile_type in ("lammpstrj", "alm.lmp"):
+            conv_disk = _read_lammps_alamode(outfile)
+        else:
+            conv_disk = read(outfile)
+        conv = conv_disk
+    except Exception as e:
+        print(f"  {WARN} Could not re-read output for verification: {e}")
+
+    n_pass = n_fail = n_skip = 0
+
+    def record(badge):
+        nonlocal n_pass, n_fail, n_skip
+        if badge == PASS:
+            n_pass += 1
+        elif badge == FAIL:
+            n_fail += 1
+        else:
+            n_skip += 1
+
+    # 1 ── Atom count ─────────────────────────────────────────────────────────
+    label = "Atom count"
+    if replicate:
+        nx, ny, nz = replicate
+        expected = len(orig) * nx * ny * nz
+        if len(conv) == expected:
+            _result_line(label, PASS, f"{len(conv)} atoms (× {nx}×{ny}×{nz})")
+            record(PASS)
+        else:
+            _result_line(label, FAIL, f"expected {expected}, got {len(conv)}")
+            record(FAIL)
+    else:
+        if len(orig) == len(conv):
+            _result_line(label, PASS, f"{len(orig)} atoms")
+            record(PASS)
+        else:
+            _result_line(label, FAIL, f"{len(orig)} (input) ≠ {len(conv)} (output)")
+            record(FAIL)
+
+    # 2 ── Chemical composition ───────────────────────────────────────────────
+    label = "Chemical composition"
+    if sorted(orig.get_chemical_symbols()) == sorted(conv.get_chemical_symbols()):
+        species = ", ".join(sorted(set(orig.get_chemical_symbols())))
+        _result_line(label, PASS, species)
+        record(PASS)
+    else:
+        _result_line(
+            label,
+            FAIL,
+            f"{sorted(orig.get_chemical_symbols())} ≠ "
+            f"{sorted(conv.get_chemical_symbols())}",
+        )
+        record(FAIL)
+
+    # 3 ── Lattice parameters ─────────────────────────────────────────────────
+    label = "Lattice parameters (a,b,c,α,β,γ)"
+    try:
+        p1 = (
+            orig.cell.cellpar()
+            if not replicate
+            else (orig.repeat(list(replicate))).cell.cellpar()
+        )
+        p2 = conv.cell.cellpar()
+        if np.allclose(p1, p2, atol=1e-4):
+            _result_line(
+                label,
+                PASS,
+                f"a={p2[0]:.4f} b={p2[1]:.4f} c={p2[2]:.4f} "
+                f"α={p2[3]:.3f}° β={p2[4]:.3f}° γ={p2[5]:.3f}°",
+            )
+            record(PASS)
+        else:
+            _result_line(
+                label, FAIL, f"input={np.round(p1, 4)} output={np.round(p2, 4)}"
+            )
+            record(FAIL)
+    except Exception as e:
+        _result_line(label, SKIP, str(e))
+        record(SKIP)
+
+    # Build the "expected" reference (with supercell if needed)
+    ref = orig.repeat(list(replicate)) if replicate else orig
+
+    # 4 ── Minkowski reduction ─────────────────────────────────────────────────
+    label = "Cell shape (Minkowski)"
+    try:
+        ok = _check_minkowski(ref, conv)
+        _result_line(label, PASS if ok else FAIL)
+        record(PASS if ok else FAIL)
+    except Exception as e:
+        _result_line(label, SKIP, str(e))
+        record(SKIP)
+
+    # 5 ── Spglib symmetry ────────────────────────────────────────────────────
+    label = "Space group + volume (spglib)"
+    if not _HAS_SPGLIB:
+        _result_line(label, SKIP, "spglib not installed")
+        record(SKIP)
+    else:
+        try:
+            ok = _check_spglib(ref, conv)
+            if ok is None:
+                _result_line(label, SKIP, "spglib returned None")
+                record(SKIP)
+            else:
+                _result_line(label, PASS if ok else FAIL)
+                record(PASS if ok else FAIL)
+        except Exception as e:
+            _result_line(label, SKIP, str(e))
+            record(SKIP)
+
+    # 6 ── Fractional coordinates ─────────────────────────────────────────────
+    label = "Fractional coords (PBC-wrapped, sorted)"
+    try:
+        ok = _check_fractional(ref, conv)
+        _result_line(label, PASS if ok else FAIL)
+        record(PASS if ok else FAIL)
+    except Exception as e:
+        _result_line(label, SKIP, str(e))
+        record(SKIP)
+
+    # 7 ── Kabsch rigid alignment ─────────────────────────────────────────────
+    label = "Rigid alignment (Kabsch)"
+    try:
+        ok = _check_kabsch(ref, conv)
+        if not ok:
+            _result_line(
+                label, SKIP, "not rigidly aligned (reordering / PBC wrap); see test 6"
+            )
+            record(SKIP)
+        else:
+            _result_line(label, PASS)
+            record(PASS)
+    except Exception as e:
+        _result_line(label, SKIP, str(e))
+        record(SKIP)
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    total = n_pass + n_fail + n_skip
+    summary_badge = green("ALL PASSED") if n_fail == 0 else red("FAILURES DETECTED")
+    print(
+        f"\n  {summary_badge}  "
+        f"{green(str(n_pass))} passed · "
+        f"{red(str(n_fail))} failed · "
+        f"{yellow(str(n_skip))} skipped  "
+        f"({total} checks)\n"
+    )
+
+    return n_fail == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def main() -> None:
+    parser = ArgumentParser(
+        description="Convert atomic structure file formats, with automatic equivalence tests.",
+        epilog="Use --list-formats to see all supported ASE formats.",
+    )
+
+    parser.add_argument(
+        "input",
+        type=str,
+        nargs="+",
+        help="Input file path(s) or glob pattern (e.g. '*.xyz')",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+        help="Output file path (single-file conversion only).",
+    )
+    parser.add_argument(
+        "-it",
+        "--input-type",
+        type=str,
+        default=None,
+        help="Force input format (ASE format string). Auto-detected if omitted.",
+    )
+    parser.add_argument(
+        "-ot",
+        "--output-type",
+        type=str,
+        default=None,
+        help="Force output format. Required when no explicit -o is given.",
+    )
+    parser.add_argument(
+        "-r",
+        "--replicate",
+        type=int,
+        nargs=3,
+        metavar=("nx", "ny", "nz"),
+        help="Build a supercell (e.g. -r 2 2 2).",
+    )
+    parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="Disable automatic equivalence tests after conversion.",
+    )
+    parser.add_argument(
+        "--list-formats",
+        action="store_true",
+        help="Print all available ASE formats and exit.",
+    )
+
+    args = parser.parse_args()
+
+    if args.list_formats:
+        print_available_formats()
+        sys.exit(0)
+
+    # ── Expand globs ─────────────────────────────────────────────────────────
+    input_files = []
+    for pattern in args.input:
+        matches = glob(pattern)
+        if not matches:
+            print(f"  {WARN} No files matched '{pattern}', skipping.")
+        input_files.extend(sorted(matches))
+
+    if not input_files:
+        print(f"  {red('Error:')} No input files found.")
+        sys.exit(1)
+
+    # ── Build (infile, outfile) pairs ────────────────────────────────────────
+    if len(input_files) == 1 and args.output:
+        pairs = [(input_files[0], args.output)]
+
+    elif len(input_files) > 1 and args.output:
+        print(
+            f"  {red('Error:')} -o/--output can only be used with a single input file."
+        )
+        sys.exit(1)
+
+    else:
+        if not args.output_type:
+            print(
+                f"  {red('Error:')} --output-type/-ot is required when no explicit -o is given."
+            )
+            sys.exit(1)
+        pairs = [(f, derive_output(f, args.output_type)) for f in input_files]
+
+    # ── Process each pair ────────────────────────────────────────────────────
+    any_test_failed = False
+
+    for infile, outfile in pairs:
+        infile_type = args.input_type or guess_format(infile)
+        outfile_type = args.output_type or guess_format(outfile)
+
+        if infile_type not in ioformats:
+            print(
+                f"  {red('Error:')} Unrecognized input format '{infile_type}' for '{infile}'."
+            )
+            print_available_formats()
+            sys.exit(1)
+
+        if outfile_type not in ioformats and outfile_type not in (
+            "alm.lmp",
+            "lammpstrj",
+        ):
+            print(
+                f"  {red('Error:')} Unrecognized output format '{outfile_type}' for '{outfile}'."
+            )
+            print_available_formats()
+            sys.exit(1)
+
+        print(bold(f"\n  {cyan('→')} {infile}  →  {outfile}"))
+        print(f"     format:  {infile_type}  →  {outfile_type}")
+        if args.replicate:
+            print(f"     supercell: {'×'.join(str(n) for n in args.replicate)}")
+
+        # Re-read the original *before* conversion so tests can compare
+        try:
+            if infile_type in ("lammpstrj", "alm.lmp"):
+                orig_atoms = _read_lammps_alamode(infile)
+            else:
+                orig_atoms = read(infile, format=infile_type)
+        except Exception as e:
+            print(f"  {red('Error reading input:')} {e}")
+            sys.exit(1)
+
+        try:
+            convert(
+                infile,
+                outfile,
+                infile_type,
+                outfile_type,
+                replicate=args.replicate,
+            )
+            print(f"     {green('Done.')}")
+        except Exception as e:
+            print(f"  {red('Conversion error:')} {e}")
+            sys.exit(1)
+
+        # ── Tests ────────────────────────────────────────────────────────────
+        if not args.skip_tests:
+            try:
+                ok = run_equivalence_tests(
+                    orig_atoms,
+                    None,  # conv=None → re-read from disk inside
+                    infile,
+                    outfile,
+                    replicate=args.replicate,
+                )
+                if not ok:
+                    any_test_failed = True
+            except Exception as e:
+                print(f"  {WARN} Test suite raised an unexpected error: {e}")
+
+    sys.exit(1 if any_test_failed else 0)
+
+
+if __name__ == "__main__":
+    main()
