@@ -142,13 +142,65 @@ def _write_lammps_alamode(ase_cell: Atoms, outfile: str) -> None:
             )
 
 
+def _read_lammps_box_bounds(lines):
+    header = lines[4].split()
+
+    raw = np.array([list(map(float, line.split())) for line in lines[5:8]])
+
+    # Orthogonal box
+    if "xy" not in header:
+        xlo, xhi = raw[0]
+        ylo, yhi = raw[1]
+        zlo, zhi = raw[2]
+
+        origin = np.array([xlo, ylo, zlo])
+        cell = np.array(
+            [
+                [xhi - xlo, 0.0, 0.0],
+                [0.0, yhi - ylo, 0.0],
+                [0.0, 0.0, zhi - zlo],
+            ]
+        )
+        return cell, origin
+
+    # Restricted triclinic LAMMPS box
+    xlo_b, xhi_b, xy = raw[0]
+    ylo_b, yhi_b, xz = raw[1]
+    zlo_b, zhi_b, yz = raw[2]
+
+    xlo = xlo_b - min(0.0, xy, xz, xy + xz)
+    xhi = xhi_b - max(0.0, xy, xz, xy + xz)
+
+    ylo = ylo_b - min(0.0, yz)
+    yhi = yhi_b - max(0.0, yz)
+
+    zlo = zlo_b
+    zhi = zhi_b
+
+    lx = xhi - xlo
+    ly = yhi - ylo
+    lz = zhi - zlo
+
+    cell = np.array(
+        [
+            [lx, 0.0, 0.0],
+            [xy, ly, 0.0],
+            [xz, yz, lz],
+        ]
+    )
+
+    origin = np.array([xlo, ylo, zlo])
+
+    return cell, origin
+
+
 def _read_lammps_dump(infile: str):
 
     with open(infile) as f:
         lines = f.readlines()
 
     Natoms = int(lines[3])
-    cell = np.array([list(map(float, line.split())) for line in lines[5:8]])
+    cell, _ = _read_lammps_box_bounds(lines)
 
     attributes = lines[8].split()[2:]
     col = {name: i for i, name in enumerate(attributes)}
@@ -220,6 +272,7 @@ def _read_lammps_dump(infile: str):
     if id_ is not None:
         atoms.set_array("id", id_)
 
+    print(atoms.cell.array)
     return atoms
 
 
