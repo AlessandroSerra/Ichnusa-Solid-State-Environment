@@ -141,6 +141,48 @@ def _forces_or_zeros(atoms: Atoms) -> np.ndarray:
         return np.zeros((len(atoms), 3), dtype=float)
 
 
+def _write_lammps_box_bounds_from_cell(f, cell: np.ndarray) -> None:
+    """
+    Write a standard LAMMPS restricted-triclinic BOX BOUNDS block.
+
+    Assumes ASE cell rows are already in restricted triclinic form:
+
+        a = (lx, 0,  0)
+        b = (xy, ly, 0)
+        c = (xz, yz, lz)
+
+    LAMMPS dump format requires:
+
+        xlo_bound xhi_bound xy
+        ylo_bound yhi_bound xz
+        zlo_bound zhi_bound yz
+    """
+    lx = float(cell[0, 0])
+    xy = float(cell[1, 0])
+    ly = float(cell[1, 1])
+    xz = float(cell[2, 0])
+    yz = float(cell[2, 1])
+    lz = float(cell[2, 2])
+
+    xlo = 0.0
+    xhi = lx
+    ylo = 0.0
+    yhi = ly
+    zlo = 0.0
+    zhi = lz
+
+    xlo_bound = xlo + min(0.0, xy, xz, xy + xz)
+    xhi_bound = xhi + max(0.0, xy, xz, xy + xz)
+
+    ylo_bound = ylo + min(0.0, yz)
+    yhi_bound = yhi + max(0.0, yz)
+
+    f.write("ITEM: BOX BOUNDS xy xz yz pp pp pp\n")
+    f.write(f"{xlo_bound:.16e} {xhi_bound:.16e} {xy:.16e}\n")
+    f.write(f"{ylo_bound:.16e} {yhi_bound:.16e} {xz:.16e}\n")
+    f.write(f"{zlo:.16e} {zhi:.16e} {yz:.16e}\n")
+
+
 def _write_lammps_alamode(
     ase_cell: Atoms,
     outfile: str,
@@ -153,6 +195,9 @@ def _write_lammps_alamode(
         writes xu yu zu
     If fractional=True:
         writes xs ys zs
+
+    The BOX BOUNDS block is written in standard LAMMPS restricted-triclinic
+    dump format, not as raw cell-vector rows.
     """
     natoms = len(ase_cell)
 
@@ -172,14 +217,8 @@ def _write_lammps_alamode(
         f.write("ITEM: TIMESTEP\n0\n")
         f.write("ITEM: NUMBER OF ATOMS\n")
         f.write(f"{natoms}\n")
-        f.write("ITEM: BOX BOUNDS xy xz yz pp pp pp\n")
 
-        # NOTE:
-        # This keeps your original convention: write the three cell-vector rows.
-        # It is not the canonical LAMMPS BOX BOUNDS restricted-triclinic format,
-        # but it matches the paired custom reader in this script.
-        for row in cell:
-            f.write(f"{row[0]:.16e} {row[1]:.16e} {row[2]:.16e}\n")
+        _write_lammps_box_bounds_from_cell(f, cell)
 
         f.write(f"ITEM: ATOMS id {pos_header} fx fy fz\n")
 
@@ -834,7 +873,10 @@ def main() -> None:
             sys.exit(1)
 
         valid_input_custom = ("alm.xyz", "alm.lmp", "lammpstrj")
-        if args.input_type not in ioformats and args.input_type not in valid_input_custom:
+        if (
+            args.input_type not in ioformats
+            and args.input_type not in valid_input_custom
+        ):
             print(
                 f"  {red('Error:')} Unrecognized input format '{args.input_type}' "
                 f"for '{input_files[0]}'."
