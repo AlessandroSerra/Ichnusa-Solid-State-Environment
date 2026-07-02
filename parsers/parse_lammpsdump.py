@@ -32,6 +32,12 @@ def parse_lammps_dump(
     -------
     Trajectory
         Lazy trajectory providing access to individual frames.
+
+    Raises
+    ------
+    ValueError
+        if the header lines are Incomplete or if no masses are found
+        and no chemical symbol is provided
     """
     filepath = Path(filename)
     offsets: list[int] = []
