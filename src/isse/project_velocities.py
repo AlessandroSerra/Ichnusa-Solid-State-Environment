@@ -326,7 +326,7 @@ def project_velocities(
     evec_filepath: str | Path,
     batch_size: int = 100,
     parseval_tolerance: float = 1e-6,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """
     Project trajectory velocities onto the phonon eigenmodes.
 
@@ -356,6 +356,8 @@ def project_velocities(
     atomic_norms : numpy.ndarray
         Mass-weighted Cartesian velocity norm for each frame, with shape
         ``(nframes,)``.
+    parseval_errors : numpy.ndarray
+        Relative Parseval error for each frame, with shape ``(nframes,)``.
 
     Raises
     ------
@@ -429,6 +431,7 @@ def project_velocities(
 
         qdot2_batches.append(qdot2_batch)
         atomic_norm_batches.append(atomic_norms_batch)
+        parseval_error_batches.append(errors_batch)
 
     if not qdot2_batches:
         nqpoints, nmodes = coefficients.shape[:2]
@@ -436,9 +439,11 @@ def project_velocities(
         return (
             np.empty((0, nqpoints, nmodes), dtype=np.float64),
             np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.float64),
         )
 
     return (
         np.concatenate(qdot2_batches, axis=0),
         np.concatenate(atomic_norm_batches, axis=0),
+        np.concatenate(parseval_error_batches, axis=0),
     )
