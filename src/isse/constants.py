@@ -8,6 +8,8 @@ ANGSTROM_TO_BOHR = 1.8897259886
 BOHR_TO_ANGSTROM = 0.5291772106
 AMU_A2_FS2_TO_EV = 103.64269653
 KB_EV_K = 8.617333262e-5
+KCAL_MOL_TO_EV = 0.0433641
+PS_TO_FS = 1e3
 
 # Approximate standard atomic weights in unified atomic mass units (u).
 # Values are intended for generic numerical use, not for isotope-resolved
