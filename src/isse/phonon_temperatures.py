@@ -19,7 +19,7 @@ def calculate_temperature(
     evec_filepath: str | Path,
     selected_iqs: NDArray[np.int32] | None = None,
     batch_size: int = 100,
-    parseval_tolerance: float | None = None,
+    parseval_tolerance: float = 1e-6,
 ) -> dict[str, NDArray[np.float64] | float]:
     """
     Project a trajectory onto phonon modes and compute modal temperatures.
@@ -62,7 +62,7 @@ def calculate_temperature(
           ``(nframes, nselected, nmodes)``. Present only if
           ``selected_iqs`` is not ``None``.
     """
-    qdot2, atomic_norms, parseval_errors = project_velocities(
+    qdot2, _, parseval_errors = project_velocities(
         trajectory,
         reference_atoms,
         evec_filepath,
