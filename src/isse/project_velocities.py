@@ -349,6 +349,10 @@ def project_velocities(
     batch_size : int, optional
         Maximum number of trajectory frames processed in each batch.
         The default is ``100``.
+    parseval_tolerance: float, optional
+        Maximum error for the parseval relation between cartesian and
+        projected velocities. Passing None skips the checks.
+        The default is 1e-6
 
     Returns
     -------
