@@ -80,18 +80,31 @@ def calculate_temperature(
     gamma_index = 0
     thermal_mask = np.ones_like(mode_temperatures, dtype=bool)
     thermal_mask[gamma_index, :3] = False
-    mean_thermal_mode_temperature = float(mode_temperatures[thermal_mask].mean())
+    mean_mode_temperature = float(mode_temperatures[thermal_mask].mean())
 
     ndof = 3 * natoms - 3
     reconstructed_temperature = float(
         mean_qdot2.sum() * AMU_A2_FS2_TO_EV / (ndof * KB_EV_K)
     )
 
+    temperature_rtol = 1e-6
+
+    relative_temperature_difference = (
+        abs(mean_mode_temperature - reconstructed_temperature) / mean_mode_temperature
+    )
+
+    if relative_temperature_difference > temperature_rtol:
+        logger.warning(
+            "Potential residual drift present in the trajectory. "
+            "Mean thermal mode temperature and reconstructed temperature differ "
+            f"by {relative_temperature_difference:.2e} relative "
+            f"(tolerance: {temperature_rtol:.1e})."
+        )
+
     results: dict[str, NDArray[np.float64] | float] = {
         "qpoints": qpoints,
         "mode_temperatures": mode_temperatures,
-        "mean_thermal_mode_temperature": mean_thermal_mode_temperature,
-        "reconstructed_temperature": reconstructed_temperature,
+        "mean_mode_temperature": mean_mode_temperature,
     }
 
     if selected_iqs is not None:
@@ -106,6 +119,6 @@ def calculate_temperature(
             )
 
     logger.info(
-        f"Reconstructed temperature: {reconstructed_temperature:.2f} K (mean thermal mode: {mean_thermal_mode_temperature:.2f} K, max Parseval error: {np.nanmax(parseval_errors):.3e}"
+        f"Reconstructed temperature: {reconstructed_temperature:.2f} K (mean thermal mode: {mean_mode_temperature:.2f} K, max Parseval error: {np.nanmax(parseval_errors):.3e}"
     )
     return results
