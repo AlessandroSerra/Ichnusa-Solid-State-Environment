@@ -191,8 +191,7 @@ def calculate_rdf(
         if is_single_frame:
             partial_g_r = partial_g_r[0]
         results["partial_g_r"] = {
-            pair: partial_g_r[..., ipair, :]
-            for ipair, pair in enumerate(pair_keys)
+            pair: partial_g_r[..., ipair, :] for ipair, pair in enumerate(pair_keys)
         }
 
     return results
@@ -455,7 +454,6 @@ if NUMBA_AVAILABLE:
 
         return counts_by_frame
 
-
     @njit(cache=True, parallel=True)
     def _histogram_partial_rdf_numba(
         positions: NDArray[np.float64],
@@ -541,7 +539,9 @@ def _normalize_rdf(
     r = 0.5 * (edges[:-1] + edges[1:])
     densities = natoms / volumes
 
-    normalization = natoms * densities[:, np.newaxis] * shell_volumes[np.newaxis, :]
+    normalization = (
+        (natoms - 1) * densities[:, np.newaxis] * shell_volumes[np.newaxis, :]
+    )
     g_r = np.divide(
         counts,
         normalization,
@@ -574,12 +574,9 @@ def _normalize_partial_rdf(
         n_first = species_counts[first]
         n_second = species_counts[second]
         if first == second:
-            prefactors = n_first * (n_first / volumes)
+            prefactors = (n_first - 1) * (n_first / volumes)
         else:
-            prefactors = (
-                n_first * (n_second / volumes)
-                + n_second * (n_first / volumes)
-            )
+            prefactors = n_first * (n_second / volumes) + n_second * (n_first / volumes)
         normalization = prefactors[:, np.newaxis] * shell_volumes[np.newaxis, :]
         g_r[:, ipair, :] = np.divide(
             counts[:, ipair, :],
