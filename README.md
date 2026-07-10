@@ -238,14 +238,14 @@ cartesian_position = fractional_position @ cell
 from isse.radial_distribution import calculate_rdf
 
 rdf = calculate_rdf(trajectory, r_max=8.0, n_bins=400)
-print(rdf["r"])
-print(rdf["g_r"])
+print(rdf["r"])       # shape (n_bins,)
+print(rdf["g_r"])     # shape (n_frames, n_bins)
 
 partial_rdf = calculate_rdf(trajectory, r_max=8.0, n_bins=400, partial=True)
-print(partial_rdf["partial_g_r"][("O", "Si")])
+print(partial_rdf["partial_g_r"][("O", "Si")])  # shape (n_frames, n_bins)
 ```
 
-The RDF implementation assumes periodic boundary conditions and uses the average cell volume over the trajectory for normalization. If `numba` is installed, the accelerated backend is used automatically; otherwise ISSE falls back to a NumPy implementation.
+The RDF implementation assumes periodic boundary conditions and returns one RDF per frame for trajectory inputs. Passing a single `Atoms` object returns one-dimensional arrays for that single configuration. If `numba` is installed, the accelerated backend is used automatically; otherwise ISSE falls back to a NumPy implementation.
 
 ## Phonon modal temperatures
 
