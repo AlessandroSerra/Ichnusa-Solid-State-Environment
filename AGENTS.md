@@ -281,7 +281,7 @@ API:
 - `calculate_rdf(trajectory, r_max, n_bins, batch_size=100, partial=False, species_pairs=None) -> dict[str, NDArray[np.float64] | dict[tuple[str, str], NDArray[np.float64]]]` con `trajectory` = `Trajectory | Atoms`
 
 Responsabilità:
-- Calcola la radial distribution function totale `g(r)` su una `Trajectory` lazy o su un singolo `Atoms`.
+- Calcola la radial distribution function totale `g(r)` per frame su una `Trajectory` lazy o su un singolo `Atoms`.
 - Opzionalmente calcola RDF parziali per tutte le coppie di specie o per `species_pairs`.
 - Processa posizioni/celle a batch.
 - Usa backend Numba se disponibile, altrimenti fallback NumPy.
@@ -289,8 +289,9 @@ Responsabilità:
 Contratti/assunzioni:
 - Ogni frame deve avere posizioni shape `(natoms, 3)` e cella `(3, 3)`.
 - Tutti i frame devono avere lo stesso numero di atomi e la stessa sequenza di simboli.
-- Output base: `r`, `g_r`, `counts`; con RDF parziali anche `partial_g_r`, `partial_counts` indicizzati da tuple di specie canoniche, es. `("O", "Si")`.
-- Normalizzazione con volume medio della traiettoria.
+- Output base: `r`, `g_r`; con RDF parziali anche `partial_g_r` indicizzato da tuple di specie canoniche, es. `("O", "Si")`.
+- Per input `Atoms`, `g_r` e ciascuna RDF parziale hanno shape `(n_bins,)`; per input `Trajectory` hanno shape `(n_frames, n_bins)`.
+- Normalizzazione frame-by-frame con il volume della cella del frame.
 
 Dipendenze interne:
 - usa `helpers.periodic.minimum_image_distances` nel fallback NumPy.
