@@ -359,9 +359,9 @@ Contratti/assunzioni:
 ### `spectral.py`
 
 API:
-- `velocity_autocorrelation(trajectory, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, time_step=None, batch_size=100) -> dict`
-- `vibrational_density_of_states(data, time_step, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, batch_size=100, gaussian_filter_width=None) -> dict`, con `data` = `Trajectory | dict{"vacf": ...} | array VACF`
-- `calculate_vdos(corr_values, time_step, gaussian_filter_width=None) -> tuple`
+- `velocity_autocorrelation(trajectory, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, time_step=None, batch_size=100) -> NDArray | tuple[NDArray, NDArray]`, restituisce `vacf` oppure `(time, vacf)` se `time_step` è fornito
+- `vibrational_density_of_states(data, time_step, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, batch_size=100, gaussian_filter_width=None) -> tuple[NDArray, NDArray]`, con `data` = `Trajectory | array VACF | tuple(time, vacf)`; restituisce `(frequency, spectrum)`
+- `calculate_vdos(corr_values, time_step, gaussian_filter_width=None) -> tuple[NDArray, NDArray]`
 
 Responsabilità:
 - calcolo della velocity autocorrelation function via FFT da sequenze lazy di frame.
