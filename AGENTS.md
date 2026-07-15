@@ -24,19 +24,20 @@
 - `src/isse/convert.py` è un converter nuovo/non tracciato che reimplementa la conversione senza ASE, usando `Atoms`, `Trajectory` e i moduli I/O e writer ISSE per i formati supportati internamente.
 - `src/isse/radial_distribution.py` e `src/isse/helpers/periodic.py` aggiungono calcolo RDF e utility PBC/minimum-image.
 - Sono presenti file in `tests/`, ma `.gitignore` ignora `tests/`: quindi non sono versionati. `.gitignore` ignora anche `dist/`, `archive/` e `src/isse/TODO.md`.
-- Nota working tree dopo questo aggiornamento: `AGENTS.md`, `src/isse/phonon_temperatures.py` e `src/isse/project_velocities.py` modificati; `src/isse/parsers/` risulta rimosso e `src/isse/io/` aggiunto; `src/isse/convert.py` non tracciato (`git status --short`).
+- Nota working tree dopo questo aggiornamento: `src/isse/constants.py` modificato e `src/isse/spectral.py` non tracciato (`git status --short`).
 
 ## 3. Albero logico
 
 ```text
 src/isse/
 ├── constants.py              # costanti fisiche, conversioni unità, masse atomiche
-├── structures.py             # Atoms e Trajectory lazy
+├── structures.py             # Atoms e Trajectory lazy anche multi-file
 ├── phonon_temperatures.py    # entry point alto livello per temperature modali
 ├── project_velocities.py     # proiezione velocità su modi fononici
 ├── convert_file.py           # CLI/converter ASE con test di equivalenza
 ├── convert.py                # converter ISSE-native senza ASE, non tracciato
 ├── radial_distribution.py    # RDF totale su Trajectory lazy
+├── spectral.py               # VACF e VDOS/spettri vibrazionali
 ├── helpers/
 │   ├── cell_mapping.py       # mapping atomi supercella -> cella primitiva + basis
 │   ├── periodic.py           # wrap/unwrap e minimum-image in PBC
@@ -69,12 +70,15 @@ Campi principali:
 Validazione in `__post_init__` su shape. Proprietà booleane: `has_unwrapped_positions`, `has_velocities`, `has_masses`, `has_forces`.
 
 #### `Trajectory`
-Sequenza lazy di `Atoms` basata su offset byte in un file e una funzione `reader(path, offset)`.
+Sequenza lazy di `Atoms` basata su offset byte e una funzione `reader(path, offset)`.
+Può rappresentare uno o più file concatenati, purché letti dallo stesso reader/reader compatibile.
 
 Caratteristiche:
 - `__getitem__(int)` legge un frame singolo.
-- `__getitem__(slice)` restituisce una nuova `Trajectory` lazy sugli offset selezionati.
+- `__getitem__(slice)` restituisce una nuova `Trajectory` lazy sugli offset selezionati, anche per traiettorie multi-file.
 - `__iter__()` itera leggendo frame on demand.
+- `__add__()` concatena lazy due `Trajectory` compatibili; `sum([traj1, traj2, ...])` è supportato.
+- `path` è disponibile solo per traiettorie single-file; `paths` restituisce tutti i file backing.
 - Memoria proporzionale al numero di frame, non alla dimensione del file.
 
 ## 5. Flussi principali
@@ -138,7 +142,7 @@ Nota: `reconstructed_temperature` viene calcolata e loggata, ma non inserita in 
 ### `constants.py`
 
 Contiene:
-- conversioni: `ANGSTROM_TO_BOHR`, `BOHR_TO_ANGSTROM`, `AMU_A2_FS2_TO_EV`, `KB_EV_K`, `KCAL_MOL_TO_EV`, `PS_TO_FS`
+- conversioni: `ANGSTROM_TO_BOHR`, `BOHR_TO_ANGSTROM`, `AMU_A2_FS2_TO_EV`, `HZ_TO_CM`, `KB_EV_K`, `KCAL_MOL_TO_EV`, `PS_TO_FS`
 - tabella `ATOMIC_MASSES`
 - helper:
   - `mass_from_symbol(symbol)`
@@ -351,6 +355,23 @@ Contratti/assunzioni:
 - Le unità LAMMPS non hanno default: l'utente deve specificare esplicitamente `input_units`/`output_units` o `units` per evitare assunzioni silenziose.
 - `lammps-data`, POSCAR/VASP sono output single-frame; per input trajectory multi-frame serve `--frame`.
 - Per LAMMPS data, i simboli chimici sono recuperabili in lettura solo passando `symbols`; i test tentano di derivarli dai simboli originali.
+
+### `spectral.py`
+
+API:
+- `velocity_autocorrelation(trajectory, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, time_step=None, batch_size=100) -> dict`
+- `vibrational_density_of_states(data, time_step, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, batch_size=100, gaussian_filter_width=None) -> dict`, con `data` = `Trajectory | dict{"vacf": ...} | array VACF`
+- `calculate_vdos(corr_values, time_step, gaussian_filter_width=None) -> tuple`
+
+Responsabilità:
+- calcolo della velocity autocorrelation function via FFT da sequenze lazy di frame.
+- trasformata coseno di Filon per ottenere VDOS/spettri vibrazionali da una `Trajectory` o da una VACF già calcolata.
+- selezione opzionale di gruppi atomici tramite array di appartenenza per-atomo (`atom_groups`) e label `group`, rimozione velocità del centro di massa e pesatura in massa.
+
+Contratti/assunzioni:
+- velocità in unità interne Å/fs; `time_step` in fs; asse spettrale restituito sempre in `cm^-1` usando frequenze in ps^-1/THz.
+- per la VACF via FFT le velocità selezionate vengono materializzate in array `(n_frames, n_atoms, 3)`.
+- `numba` è opzionale per la trasformata di Filon; fallback Python disponibile.
 
 ## 7. Punti di attenzione / debito tecnico
 
