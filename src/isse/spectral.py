@@ -29,7 +29,7 @@ def velocity_autocorrelation(
     remove_com: bool = True,
     time_step: float | None = None,
     batch_size: int = 100,
-) -> dict[str, NDArray[np.float64]]:
+) -> NDArray[np.float64] | tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
     Calculate a velocity autocorrelation function using an FFT algorithm.
 
@@ -55,7 +55,7 @@ def velocity_autocorrelation(
         atoms before selecting ``group``.
     time_step
         Optional time step between frames, in ISSE internal time units (fs). If
-        provided, ``time`` is included in the returned dictionary.
+        provided, the function returns ``(time, vacf)``.
     batch_size
         Number of lazy trajectory frames collected per batch before the FFT.
         The VACF FFT still requires the selected velocity time series to be
@@ -69,8 +69,9 @@ def velocity_autocorrelation(
 
     Returns
     -------
-    dict
-        Contains ``vacf``. Also contains ``time`` when ``time_step`` is provided.
+    NDArray[np.float64] or tuple[NDArray[np.float64], NDArray[np.float64]]
+        Returns ``vacf`` when ``time_step`` is not provided. Returns
+        ``(time, vacf)`` when ``time_step`` is provided.
     """
     velocities, masses = _collect_velocities_and_masses(
         trajectory,
@@ -97,16 +98,19 @@ def velocity_autocorrelation(
         max_correlation_len=max_correlation_len,
     )
 
-    results: dict[str, NDArray[np.float64]] = {"vacf": vacf}
-    if time_step is not None:
-        if time_step <= 0:
-            raise ValueError("time_step must be positive")
-        results["time"] = np.arange(vacf.shape[0], dtype=np.float64) * float(time_step)
-    return results
+    if time_step is None:
+        return vacf
+    if time_step <= 0:
+        raise ValueError("time_step must be positive")
+    time = np.arange(vacf.shape[0], dtype=np.float64) * float(time_step)
+    return time, vacf
 
 
 def vibrational_density_of_states(
-    data: Trajectory | dict[str, NDArray[np.float64]] | Sequence[float] | NDArray[np.floating],
+    data: Trajectory
+    | Sequence[float]
+    | NDArray[np.floating]
+    | tuple[NDArray[np.float64], NDArray[np.float64]],
     time_step: float,
     *,
     atom_groups: Sequence[int] | NDArray[np.int32] | None = None,
@@ -116,16 +120,17 @@ def vibrational_density_of_states(
     remove_com: bool = True,
     batch_size: int = 100,
     gaussian_filter_width: float | None = None,
-) -> dict[str, NDArray[np.float64]]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
     Calculate a vibrational spectrum from a trajectory or from a precomputed VACF.
 
     Parameters
     ----------
     data
-        Either a lazy :class:`~isse.structures.Trajectory`, a VACF array, or a
-        dictionary returned by :func:`velocity_autocorrelation` containing
-        ``"vacf"``. Any stored time axis is ignored; pass ``time_step`` instead.
+        Either a lazy :class:`~isse.structures.Trajectory`, a VACF array, or the
+        ``(time, vacf)`` tuple returned by :func:`velocity_autocorrelation` when
+        called with ``time_step``. Any stored time axis is ignored; pass
+        ``time_step`` explicitly.
     time_step
         Time step between frames or VACF points, in ISSE internal time units
         (fs).
@@ -139,10 +144,8 @@ def vibrational_density_of_states(
 
     Returns
     -------
-    dict
-        Contains ``frequency`` in cm^-1, ``spectrum``, ``vacf`` and the time
-        axis used for the transform. If a Gaussian filter is used, also contains
-        ``filtered_vacf`` and ``filter_window``.
+    tuple[NDArray[np.float64], NDArray[np.float64]]
+        ``(frequency, spectrum)``, with ``frequency`` in cm^-1.
     """
     corr, times = _prepare_vdos_input(
         data,
@@ -156,6 +159,8 @@ def vibrational_density_of_states(
     )
     if corr.shape[0] < 3:
         raise ValueError("vacf must contain at least three points")
+    if times.shape != corr.shape:
+        raise ValueError("time axis and vacf must have the same length")
 
     dt = times[1] - times[0]
     if not np.allclose(np.diff(times), dt, rtol=1.0e-8, atol=1.0e-12):
@@ -178,7 +183,6 @@ def vibrational_density_of_states(
     t_max_ps = float(n_intervals) * dt_ps
     delta_omega = 1.0 / t_max_ps
 
-    results: dict[str, NDArray[np.float64]] = {}
     if gaussian_filter_width is not None:
         if gaussian_filter_width < 0:
             raise ValueError("gaussian_filter_width must be non-negative")
@@ -187,8 +191,6 @@ def vibrational_density_of_states(
             -0.5 * (0.5 * float(gaussian_filter_width) * indices / n_intervals) ** 2
         )
         corr *= window
-        results["filtered_vacf"] = corr.copy()
-        results["filter_window"] = window
 
     spectrum = np.zeros(n_intervals + 1, dtype=np.float64)
     _filon_cosine_transform(
@@ -202,11 +204,7 @@ def vibrational_density_of_states(
     angular_frequency = np.arange(n_intervals + 1, dtype=np.float64) * delta_omega
     frequency = angular_frequency / TWO_PI * HZ_TO_CM
 
-    results["vacf"] = corr.copy()
-    results["time"] = times.copy()
-    results["frequency"] = frequency
-    results["spectrum"] = spectrum
-    return results
+    return frequency, spectrum
 
 
 def calculate_vdos(
@@ -216,16 +214,18 @@ def calculate_vdos(
     gaussian_filter_width: float | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compatibility wrapper around :func:`vibrational_density_of_states`."""
-    results = vibrational_density_of_states(
+    return vibrational_density_of_states(
         corr_values,
         time_step,
         gaussian_filter_width=gaussian_filter_width,
     )
-    return results["frequency"], results["spectrum"]
 
 
 def _prepare_vdos_input(
-    data: Trajectory | dict[str, NDArray[np.float64]] | Sequence[float] | NDArray[np.floating],
+    data: Trajectory
+    | Sequence[float]
+    | NDArray[np.floating]
+    | tuple[NDArray[np.float64], NDArray[np.float64]],
     *,
     time_step: float,
     atom_groups: Sequence[int] | NDArray[np.int32] | None,
@@ -246,16 +246,10 @@ def _prepare_vdos_input(
             time_step=time_step,
             batch_size=batch_size,
         )
-        corr = np.asarray(vacf_results["vacf"], dtype=np.float64).reshape(-1)
-        times = np.asarray(vacf_results["time"], dtype=np.float64).reshape(-1)
-        return corr, times
-
-    if isinstance(data, dict):
-        if "vacf" not in data:
-            raise ValueError("VACF dictionary input must contain a 'vacf' entry")
-        corr = np.asarray(data["vacf"], dtype=np.float64).reshape(-1)
-        times = _prepare_time_axis(time_step=time_step, n=corr.size)
-        return corr, times
+        times, corr = vacf_results
+        return np.asarray(corr, dtype=np.float64).reshape(-1), np.asarray(
+            times, dtype=np.float64
+        ).reshape(-1)
 
     has_vacf_options = (
         any(option is not None for option in (atom_groups, group, max_correlation_len))
@@ -266,7 +260,10 @@ def _prepare_vdos_input(
     if has_vacf_options:
         raise ValueError("VACF calculation options require trajectory input")
 
-    corr = np.asarray(data, dtype=np.float64).reshape(-1)
+    if isinstance(data, tuple) and len(data) == 2:
+        corr = np.asarray(data[1], dtype=np.float64).reshape(-1)
+    else:
+        corr = np.asarray(data, dtype=np.float64).reshape(-1)
     times = _prepare_time_axis(time_step=time_step, n=corr.size)
     return corr, times
 
