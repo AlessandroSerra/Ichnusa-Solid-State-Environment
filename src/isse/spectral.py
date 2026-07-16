@@ -120,6 +120,7 @@ def vibrational_density_of_states(
     remove_com: bool = True,
     batch_size: int = 100,
     gaussian_filter_width: float | None = None,
+    method: str = "fft",
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
     Calculate a vibrational spectrum from a trajectory or from a precomputed VACF.
@@ -139,8 +140,14 @@ def vibrational_density_of_states(
         calculated first. The internally calculated VACF is always normalized
         and averaged over the available time origins.
     gaussian_filter_width
-        Optional dimensionless Gaussian damping width, following the archived
-        Fortran-style implementation.
+        Optional dimensionless Gaussian damping width. For ``method="fft"`` it
+        is applied as a Gaussian window before the real FFT; for
+        ``method="filon"`` it follows the archived Fortran-style
+        implementation.
+    method
+        Transform backend. ``"fft"`` is the fast default and scales as
+        O(N log N). ``"filon"`` keeps the legacy Filon cosine transform and
+        scales as O(N^2).
 
     Returns
     -------
@@ -168,20 +175,96 @@ def vibrational_density_of_states(
     if dt <= 0:
         raise ValueError("time axis must be strictly increasing")
 
+    corr = corr.copy()
+    dt_ps = float(dt) / PS_TO_FS
+
+    method_normalized = method.lower()
+    if method_normalized == "fft":
+        return _vdos_fft(
+            corr,
+            dt_ps=dt_ps,
+            gaussian_filter_width=gaussian_filter_width,
+        )
+    if method_normalized == "filon":
+        return _vdos_filon(
+            corr,
+            dt_ps=dt_ps,
+            gaussian_filter_width=gaussian_filter_width,
+        )
+    raise ValueError("method must be 'fft' or 'filon'")
+
+
+def calculate_vdos(
+    corr_values: Sequence[float] | NDArray[np.floating],
+    time_step: float,
+    *,
+    gaussian_filter_width: float | None = None,
+    method: str = "fft",
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compatibility wrapper around :func:`vibrational_density_of_states`."""
+    return vibrational_density_of_states(
+        corr_values,
+        time_step,
+        gaussian_filter_width=gaussian_filter_width,
+        method=method,
+    )
+
+
+def _vdos_fft(
+    corr: NDArray[np.float64],
+    *,
+    dt_ps: float,
+    gaussian_filter_width: float | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    if dt_ps <= 0:
+        raise ValueError("time step must be positive")
+    if gaussian_filter_width is not None and gaussian_filter_width < 0:
+        raise ValueError("gaussian_filter_width must be non-negative")
+
+    values = np.asarray(corr, dtype=np.float64).copy()
+    n_points = values.size
+    if n_points < 3:
+        raise ValueError("FFT transform requires at least three points")
+
+    if gaussian_filter_width is not None:
+        indices = np.arange(n_points, dtype=np.float64)
+        window = np.exp(
+            -0.5 * (0.5 * float(gaussian_filter_width) * indices / (n_points - 1)) ** 2
+        )
+        values *= window
+
+    # One-sided cosine transform with trapezoidal endpoint weights:
+    # spectrum(f) = 2 * int_0^T C(t) cos(2*pi*f*t) dt.
+    values[0] *= 0.5
+    values[-1] *= 0.5
+    spectrum = 2.0 * dt_ps * np.real(np.fft.rfft(values))
+    frequency = np.fft.rfftfreq(n_points, d=dt_ps) * HZ_TO_CM
+    return frequency.astype(np.float64, copy=False), spectrum.astype(
+        np.float64, copy=False
+    )
+
+
+def _vdos_filon(
+    corr: NDArray[np.float64],
+    *,
+    dt_ps: float,
+    gaussian_filter_width: float | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    if dt_ps <= 0:
+        raise ValueError("time step must be positive")
+
     n_intervals = corr.size - 1
     if n_intervals % 2 != 0:
         n_intervals -= 1
         corr = corr[: n_intervals + 1].copy()
-        times = times[: n_intervals + 1]
     else:
         corr = corr.copy()
 
     if n_intervals < 2:
         raise ValueError("Filon transform requires at least two time intervals")
 
-    dt_ps = float(dt) / PS_TO_FS
     t_max_ps = float(n_intervals) * dt_ps
-    delta_omega = 1.0 / t_max_ps
+    delta_omega = TWO_PI / t_max_ps
 
     if gaussian_filter_width is not None:
         if gaussian_filter_width < 0:
@@ -203,22 +286,7 @@ def vibrational_density_of_states(
 
     angular_frequency = np.arange(n_intervals + 1, dtype=np.float64) * delta_omega
     frequency = angular_frequency / TWO_PI * HZ_TO_CM
-
     return frequency, spectrum
-
-
-def calculate_vdos(
-    corr_values: Sequence[float] | NDArray[np.floating],
-    time_step: float,
-    *,
-    gaussian_filter_width: float | None = None,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compatibility wrapper around :func:`vibrational_density_of_states`."""
-    return vibrational_density_of_states(
-        corr_values,
-        time_step,
-        gaussian_filter_width=gaussian_filter_width,
-    )
 
 
 def _prepare_vdos_input(
