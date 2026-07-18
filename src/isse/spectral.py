@@ -5,7 +5,7 @@ from collections.abc import Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from .constants import HZ_TO_CM, PS_TO_FS, masses_from_symbols
+from .constants import HZ_TO_CM, masses_from_symbols
 from .structures import Trajectory
 
 try:
@@ -54,8 +54,9 @@ def velocity_autocorrelation(
         If ``True``, remove the instantaneous center-of-mass velocity of all
         atoms before selecting ``group``.
     time_step
-        Optional time step between frames, in ISSE internal time units (fs). If
-        provided, the function returns ``(time, vacf)``.
+        Optional time interval between consecutive stored trajectory frames, in
+        ps. This is the sampling interval of the VACF, not necessarily the MD
+        integrator time step. If provided, the function returns ``(time, vacf)``.
     batch_size
         Number of lazy trajectory frames collected per batch before the FFT.
         The VACF FFT still requires the selected velocity time series to be
@@ -133,8 +134,9 @@ def vibrational_density_of_states(
         called with ``time_step``. Any stored time axis is ignored; pass
         ``time_step`` explicitly.
     time_step
-        Time step between frames or VACF points, in ISSE internal time units
-        (fs).
+        Time interval between consecutive stored frames or VACF points, in ps.
+        This is the sampling interval of the VACF, not necessarily the MD
+        integrator time step.
     atom_groups, group, max_correlation_len, mass_weighted, remove_com, batch_size
         Options used only when ``data`` is a trajectory and the VACF must be
         calculated first. The internally calculated VACF is always normalized
@@ -176,7 +178,7 @@ def vibrational_density_of_states(
         raise ValueError("time axis must be strictly increasing")
 
     corr = corr.copy()
-    dt_ps = float(dt) / PS_TO_FS
+    dt_ps = float(dt)
 
     method_normalized = method.lower()
     if method_normalized == "fft":
@@ -264,7 +266,10 @@ def _vdos_filon(
         raise ValueError("Filon transform requires at least two time intervals")
 
     t_max_ps = float(n_intervals) * dt_ps
-    delta_omega = TWO_PI / t_max_ps
+    # Keep the legacy/archive Filon frequency grid: despite the name, this
+    # spacing is the Fortran-style DOM value 1 / t_max, later converted from
+    # angular frequency to linear frequency by dividing by 2*pi.
+    delta_omega = 1.0 / t_max_ps
 
     if gaussian_filter_width is not None:
         if gaussian_filter_width < 0:
