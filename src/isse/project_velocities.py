@@ -354,12 +354,13 @@ def project_velocities(
     qdot2_batches: list[NDArray[np.float64]] = []
     atomic_norm_batches: list[NDArray[np.float64]] = []
     parseval_error_batches: list[NDArray[np.float64]] = []
-    ibatch = 0
 
-    for velocities in _iter_velocity_batches(
-        trajectory,
-        natoms=len(reference_atoms),
-        batch_size=batch_size,
+    for ibatch, velocities in enumerate(
+        _iter_velocity_batches(
+            trajectory,
+            natoms=len(reference_atoms),
+            batch_size=batch_size,
+        )
     ):
         qdot2_batch, atomic_norms_batch = _project_batch_numba(
             velocities,
@@ -367,7 +368,6 @@ def project_velocities(
             coefficients,
         )
         errors_batch = _compute_parseval_errors(qdot2_batch, atomic_norms_batch)
-        ibatch += 1
         logger.debug(f"Batch {ibatch}: max Parseval error = {np.nanmax(errors_batch)}")
 
         if (
