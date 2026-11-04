@@ -4,17 +4,10 @@ from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
+from numba import njit, prange
 
 from .constants import HZ_TO_CM, PS_TO_FS, masses_from_symbols
 from .structures import Trajectory
-
-try:
-    from numba import njit, prange
-
-    NUMBA_AVAILABLE = True
-except ImportError:
-    NUMBA_AVAILABLE = False
-
 
 TWO_PI = 2.0 * np.pi
 
@@ -472,81 +465,8 @@ def _prepare_time_axis(
     return np.arange(n, dtype=np.float64) * float(time_step)
 
 
-def _filon_cosine_transform_numpy(
-    dt: float,
-    delta_omega: float,
-    n_intervals: int,
-    corr: NDArray[np.float64],
-    out: NDArray[np.float64],
-) -> None:
-    if n_intervals % 2 != 0:
-        raise ValueError("n_intervals must be even for the Filon transform")
-    if corr.shape[0] != n_intervals + 1:
-        raise ValueError("corr length must be n_intervals + 1")
-    if out.shape[0] != n_intervals + 1:
-        raise ValueError("out length must be n_intervals + 1")
-
-    t_max = float(n_intervals) * dt
-    nu = np.arange(n_intervals + 1, dtype=np.float64)
-    theta = nu * delta_omega * dt
-
-    sin_theta = np.sin(theta)
-    cos_theta = np.cos(theta)
-    alpha = np.empty_like(theta)
-    beta = np.empty_like(theta)
-    gamma = np.empty_like(theta)
-
-    small = np.abs(theta) < 1.0e-9
-    alpha[small] = 0.0
-    beta[small] = 2.0 / 3.0
-    gamma[small] = 4.0 / 3.0
-
-    regular = ~small
-    theta_regular = theta[regular]
-    sin_regular = sin_theta[regular]
-    cos_regular = cos_theta[regular]
-    theta2 = theta_regular * theta_regular
-    theta3 = theta2 * theta_regular
-    alpha[regular] = (
-        theta2 + theta_regular * sin_regular * cos_regular - 2.0 * sin_regular**2
-    ) / theta3
-    beta[regular] = (
-        2.0
-        * (theta_regular * (1.0 + cos_regular**2) - 2.0 * sin_regular * cos_regular)
-        / theta3
-    )
-    gamma[regular] = 4.0 * (sin_regular - theta_regular * cos_regular) / theta3
-
-    even_indices = np.arange(0, n_intervals + 1, 2, dtype=np.float64)
-    odd_indices = np.arange(1, n_intervals, 2, dtype=np.float64)
-    corr_even = corr[::2]
-    corr_odd = corr[1:n_intervals:2]
-
-    for inu, theta_value in enumerate(theta):
-        cos_even = np.cos(theta_value * even_indices)
-        even_sum = np.dot(corr_even, cos_even)
-        even_sum -= 0.5 * (
-            corr[0] + corr[n_intervals] * np.cos(theta_value * float(n_intervals))
-        )
-
-        if odd_indices.size:
-            odd_sum = np.dot(corr_odd, np.cos(theta_value * odd_indices))
-        else:
-            odd_sum = 0.0
-
-        omega = float(inu) * delta_omega
-        out[inu] = (
-            2.0
-            * (
-                alpha[inu] * corr[n_intervals] * np.sin(omega * t_max)
-                + beta[inu] * even_sum
-                + gamma[inu] * odd_sum
-            )
-            * dt
-        )
-
-
-def _filon_cosine_transform_numba(
+@njit(cache=True, parallel=True)
+def _filon_cosine_transform(
     dt: float,
     delta_omega: float,
     n_intervals: int,
@@ -605,11 +525,3 @@ def _filon_cosine_transform_numba(
             )
             * dt
         )
-
-
-if NUMBA_AVAILABLE:
-    _filon_cosine_transform = njit(cache=True, parallel=True)(
-        _filon_cosine_transform_numba
-    )
-else:
-    _filon_cosine_transform = _filon_cosine_transform_numpy

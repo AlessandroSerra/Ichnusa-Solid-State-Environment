@@ -14,7 +14,7 @@ The project provides lightweight atomistic data structures, lazy trajectory I/O,
 - Explicit unit handling for LAMMPS `metal` and `real` unit styles.
 - Dependency-light conversion utilities without ASE.
 - Phonon modal temperature workflow using ALAMODE eigenvector files.
-- Radial distribution function calculation with optional Numba acceleration.
+- Radial distribution function calculation using Numba.
 - Velocity autocorrelation and vibrational density of states utilities.
 - Periodic-boundary utilities for wrapping, unwrapping, and minimum-image distances.
 
@@ -38,12 +38,9 @@ Runtime dependencies are:
 
 - `numpy`
 - `spglib`
+- `numba`
 
-Optional performance dependency:
-
-- `numba`, installable with `pip install .[performance]` or the equivalent `uv` extra.
-
-If `numba` is not installed, ISSE falls back to NumPy implementations where available.
+Numba is required for the velocity projection, RDF, and Filon transform implementations; no NumPy fallback is provided.
 
 ## Internal unit convention
 
@@ -265,7 +262,7 @@ partial_rdf = calculate_rdf(trajectory, r_max=8.0, n_bins=400, partial=True)
 print(partial_rdf["partial_g_r"][("O", "Si")])  # shape (n_frames, n_bins)
 ```
 
-The RDF implementation assumes periodic boundary conditions and returns one RDF per frame for trajectory inputs. Passing a single `Atoms` object returns one-dimensional arrays for that single configuration. If `numba` is installed, the accelerated backend is used automatically; otherwise ISSE falls back to a NumPy implementation.
+The RDF implementation assumes periodic boundary conditions and returns one RDF per frame for trajectory inputs. Passing a single `Atoms` object returns one-dimensional arrays for that single configuration. RDF histograms are computed with Numba, parallelized over frames.
 
 ## Phonon modal temperatures
 

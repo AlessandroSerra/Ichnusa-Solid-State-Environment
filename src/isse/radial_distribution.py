@@ -5,14 +5,8 @@ from collections.abc import Iterator, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-try:
-    from numba import njit, prange
+from numba import njit, prange
 
-    NUMBA_AVAILABLE = True
-except ImportError:
-    NUMBA_AVAILABLE = False
-
-from .helpers.periodic import minimum_image_distances
 from .structures import Atoms, Trajectory
 
 
@@ -103,52 +97,19 @@ def calculate_rdf(
             )
 
         inverse_cells = np.linalg.inv(cells)
-        if NUMBA_AVAILABLE:
-            batch_counts = _histogram_rdf_numba(
-                positions,
-                cells,
-                inverse_cells,
-                r_max,
-                dr,
-                n_bins,
-            )
-        else:
-            batch_counts = _histogram_rdf_numpy(
-                positions,
-                cells,
-                r_max,
-                dr,
-                n_bins,
-            )
-
+        batch_counts, batch_partial_counts = _histogram_rdf_numba(
+            positions,
+            cells,
+            inverse_cells,
+            r_max,
+            dr,
+            n_bins,
+            species_ids,
+            pair_index,
+            len(pair_keys),
+        )
         count_batches.append(batch_counts)
-
         if compute_partial:
-            if species_ids is None or pair_index is None:
-                raise RuntimeError("Partial RDF metadata was not initialized.")
-            if NUMBA_AVAILABLE:
-                batch_partial_counts = _histogram_partial_rdf_numba(
-                    positions,
-                    cells,
-                    inverse_cells,
-                    species_ids,
-                    pair_index,
-                    r_max,
-                    dr,
-                    n_bins,
-                    len(pair_keys),
-                )
-            else:
-                batch_partial_counts = _histogram_partial_rdf_numpy(
-                    positions,
-                    cells,
-                    species_ids,
-                    pair_index,
-                    r_max,
-                    dr,
-                    n_bins,
-                    len(pair_keys),
-                )
             partial_count_batches.append(batch_partial_counts)
         volumes.extend(np.abs(np.linalg.det(cells)).tolist())
         nframes += positions.shape[0]
@@ -319,210 +280,81 @@ def _prepare_partial_rdf(
     return species_ids, species_counts, pair_keys, pair_index
 
 
-def _histogram_rdf_numpy(
+@njit(cache=True, parallel=True)
+def _histogram_rdf_numba(
     positions: NDArray[np.float64],
     cells: NDArray[np.float64],
+    inverse_cells: NDArray[np.float64],
     r_max: float,
     dr: float,
     nbins: int,
-) -> NDArray[np.float64]:
+    species_ids: NDArray[np.int64] | None = None,
+    pair_index: NDArray[np.int64] | None = None,
+    npairs: int = 0,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
-    Accumulate RDF pair counts using a readable NumPy fallback.
+    Accumulate total and optional partial counts in one pass over pairs.
 
-    Pair distances are computed with the minimum image convention. Each pair
-    ``i < j`` contributes ``2`` counts because atom ``i`` sees atom ``j`` and
-    atom ``j`` sees atom ``i``.
-    """
-    nframes, natoms, _ = positions.shape
-    counts = np.zeros((nframes, nbins), dtype=np.float64)
-
-    for iframe in range(nframes):
-        frame_positions = positions[iframe]
-        cell = cells[iframe]
-        frame_counts = counts[iframe]
-
-        for iatom in range(natoms - 1):
-            displacements = frame_positions[iatom + 1 :] - frame_positions[iatom]
-            distances = minimum_image_distances(displacements, cell)
-            selected = distances < r_max
-            bin_indices = np.floor(distances[selected] / dr).astype(np.int64)
-            frame_counts += 2.0 * np.bincount(bin_indices, minlength=nbins)[:nbins]
-
-    return counts
-
-
-def _histogram_partial_rdf_numpy(
-    positions: NDArray[np.float64],
-    cells: NDArray[np.float64],
-    species_ids: NDArray[np.int64],
-    pair_index: NDArray[np.int64],
-    r_max: float,
-    dr: float,
-    nbins: int,
-    npairs: int,
-) -> NDArray[np.float64]:
-    """
-    Accumulate partial RDF pair counts using a readable NumPy fallback.
+    Each pair ``i < j`` contributes ``2`` counts because atom ``i`` sees
+    atom ``j`` and atom ``j`` sees atom ``i``. Distances are reused for
+    partial counts. Each frame owns its histograms, avoiding shared writes.
+    Without partials, their count array has shape ``(nframes, 0, nbins)``.
     """
     nframes, natoms, _ = positions.shape
-    counts = np.zeros((nframes, npairs, nbins), dtype=np.float64)
+    counts_by_frame = np.zeros((nframes, nbins), dtype=np.float64)
 
-    for iframe in range(nframes):
-        frame_positions = positions[iframe]
+    partial_counts = np.zeros((nframes, npairs, nbins), dtype=np.float64)
+
+    for iframe in prange(nframes):
         cell = cells[iframe]
-        frame_counts = counts[iframe]
+        inverse_cell = inverse_cells[iframe]
+        frame_counts = counts_by_frame[iframe]
 
         for iatom in range(natoms - 1):
-            displacements = frame_positions[iatom + 1 :] - frame_positions[iatom]
-            distances = minimum_image_distances(displacements, cell)
-            i_species = species_ids[iatom]
+            xi = positions[iframe, iatom, 0]
+            yi = positions[iframe, iatom, 1]
+            zi = positions[iframe, iatom, 2]
 
-            for joffset, distance in enumerate(distances):
-                if distance >= r_max:
-                    continue
-                jatom = iatom + 1 + joffset
-                ipair = pair_index[i_species, species_ids[jatom]]
-                if ipair < 0:
-                    continue
-                ibin = int(distance / dr)
-                frame_counts[ipair, ibin] += 2.0
+            for jatom in range(iatom + 1, natoms):
+                dx = positions[iframe, jatom, 0] - xi
+                dy = positions[iframe, jatom, 1] - yi
+                dz = positions[iframe, jatom, 2] - zi
 
-    return counts
+                sx = (
+                    dx * inverse_cell[0, 0]
+                    + dy * inverse_cell[1, 0]
+                    + dz * inverse_cell[2, 0]
+                )
+                sy = (
+                    dx * inverse_cell[0, 1]
+                    + dy * inverse_cell[1, 1]
+                    + dz * inverse_cell[2, 1]
+                )
+                sz = (
+                    dx * inverse_cell[0, 2]
+                    + dy * inverse_cell[1, 2]
+                    + dz * inverse_cell[2, 2]
+                )
 
+                sx -= np.rint(sx)
+                sy -= np.rint(sy)
+                sz -= np.rint(sz)
 
-if NUMBA_AVAILABLE:
+                dx = sx * cell[0, 0] + sy * cell[1, 0] + sz * cell[2, 0]
+                dy = sx * cell[0, 1] + sy * cell[1, 1] + sz * cell[2, 1]
+                dz = sx * cell[0, 2] + sy * cell[1, 2] + sz * cell[2, 2]
 
-    @njit(cache=True, parallel=True)
-    def _histogram_rdf_numba(
-        positions: NDArray[np.float64],
-        cells: NDArray[np.float64],
-        inverse_cells: NDArray[np.float64],
-        r_max: float,
-        dr: float,
-        nbins: int,
-    ) -> NDArray[np.float64]:
-        """
-        Accumulate RDF pair counts using a Numba backend parallel over frames.
-        """
-        nframes, natoms, _ = positions.shape
-        counts_by_frame = np.zeros((nframes, nbins), dtype=np.float64)
+                distance = np.sqrt(dx * dx + dy * dy + dz * dz)
 
-        for iframe in prange(nframes):
-            cell = cells[iframe]
-            inverse_cell = inverse_cells[iframe]
-            frame_counts = counts_by_frame[iframe]
+                if distance < r_max:
+                    ibin = int(distance / dr)
+                    frame_counts[ibin] += 2.0
+                    if species_ids is not None and pair_index is not None:
+                        ipair = pair_index[species_ids[iatom], species_ids[jatom]]
+                        if ipair >= 0:
+                            partial_counts[iframe, ipair, ibin] += 2.0
 
-            for iatom in range(natoms - 1):
-                xi = positions[iframe, iatom, 0]
-                yi = positions[iframe, iatom, 1]
-                zi = positions[iframe, iatom, 2]
-
-                for jatom in range(iatom + 1, natoms):
-                    dx = positions[iframe, jatom, 0] - xi
-                    dy = positions[iframe, jatom, 1] - yi
-                    dz = positions[iframe, jatom, 2] - zi
-
-                    sx = (
-                        dx * inverse_cell[0, 0]
-                        + dy * inverse_cell[1, 0]
-                        + dz * inverse_cell[2, 0]
-                    )
-                    sy = (
-                        dx * inverse_cell[0, 1]
-                        + dy * inverse_cell[1, 1]
-                        + dz * inverse_cell[2, 1]
-                    )
-                    sz = (
-                        dx * inverse_cell[0, 2]
-                        + dy * inverse_cell[1, 2]
-                        + dz * inverse_cell[2, 2]
-                    )
-
-                    sx -= np.rint(sx)
-                    sy -= np.rint(sy)
-                    sz -= np.rint(sz)
-
-                    dx = sx * cell[0, 0] + sy * cell[1, 0] + sz * cell[2, 0]
-                    dy = sx * cell[0, 1] + sy * cell[1, 1] + sz * cell[2, 1]
-                    dz = sx * cell[0, 2] + sy * cell[1, 2] + sz * cell[2, 2]
-
-                    distance = np.sqrt(dx * dx + dy * dy + dz * dz)
-
-                    if distance < r_max:
-                        ibin = int(distance / dr)
-                        frame_counts[ibin] += 2.0
-
-        return counts_by_frame
-
-    @njit(cache=True, parallel=True)
-    def _histogram_partial_rdf_numba(
-        positions: NDArray[np.float64],
-        cells: NDArray[np.float64],
-        inverse_cells: NDArray[np.float64],
-        species_ids: NDArray[np.int64],
-        pair_index: NDArray[np.int64],
-        r_max: float,
-        dr: float,
-        nbins: int,
-        npairs: int,
-    ) -> NDArray[np.float64]:
-        """
-        Accumulate partial RDF pair counts using a Numba backend.
-        """
-        nframes, natoms, _ = positions.shape
-        counts_by_frame = np.zeros((nframes, npairs, nbins), dtype=np.float64)
-
-        for iframe in prange(nframes):
-            cell = cells[iframe]
-            inverse_cell = inverse_cells[iframe]
-            frame_counts = counts_by_frame[iframe]
-
-            for iatom in range(natoms - 1):
-                xi = positions[iframe, iatom, 0]
-                yi = positions[iframe, iatom, 1]
-                zi = positions[iframe, iatom, 2]
-                i_species = species_ids[iatom]
-
-                for jatom in range(iatom + 1, natoms):
-                    ipair = pair_index[i_species, species_ids[jatom]]
-                    if ipair < 0:
-                        continue
-
-                    dx = positions[iframe, jatom, 0] - xi
-                    dy = positions[iframe, jatom, 1] - yi
-                    dz = positions[iframe, jatom, 2] - zi
-
-                    sx = (
-                        dx * inverse_cell[0, 0]
-                        + dy * inverse_cell[1, 0]
-                        + dz * inverse_cell[2, 0]
-                    )
-                    sy = (
-                        dx * inverse_cell[0, 1]
-                        + dy * inverse_cell[1, 1]
-                        + dz * inverse_cell[2, 1]
-                    )
-                    sz = (
-                        dx * inverse_cell[0, 2]
-                        + dy * inverse_cell[1, 2]
-                        + dz * inverse_cell[2, 2]
-                    )
-
-                    sx -= np.rint(sx)
-                    sy -= np.rint(sy)
-                    sz -= np.rint(sz)
-
-                    dx = sx * cell[0, 0] + sy * cell[1, 0] + sz * cell[2, 0]
-                    dy = sx * cell[0, 1] + sy * cell[1, 1] + sz * cell[2, 1]
-                    dz = sx * cell[0, 2] + sy * cell[1, 2] + sz * cell[2, 2]
-
-                    distance = np.sqrt(dx * dx + dy * dy + dz * dz)
-
-                    if distance < r_max:
-                        ibin = int(distance / dr)
-                        frame_counts[ipair, ibin] += 2.0
-
-        return counts_by_frame
+    return counts_by_frame, partial_counts
 
 
 def _normalize_rdf(

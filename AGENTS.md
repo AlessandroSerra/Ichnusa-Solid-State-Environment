@@ -110,7 +110,7 @@ Trajectory + reference Atoms + ALAMODE .evec
     ├─ _iter_velocity_batches(trajectory, natoms, batch_size)
     │     -> batch velocità, shape (nframes_batch, natoms, 3)
     │
-    ├─ _project_batch_numba oppure _project_batch_numpy
+    ├─ _project_batch_numba
     │     -> qdot2, atomic_norms
     │
     └─ _compute_parseval_errors(...)
@@ -257,8 +257,7 @@ Helper:
 - `_compute_parseval_errors(qdot2, atomic_norms)`
 - `_precompute_coefficients(qpoints, eigenvectors, cell_indices, basis_indices, masses)`
 - `_iter_velocity_batches(trajectory, natoms, batch_size)`
-- `_project_batch_numpy(...)`
-- `_project_batch_numba(...)` se `numba` disponibile
+- `_project_batch_numba(...)` (Numba obbligatorio)
 
 Contratti importanti:
 - `reference_atoms.masses` deve essere presente.
@@ -288,7 +287,7 @@ Responsabilità:
 - Calcola la radial distribution function totale `g(r)` per frame su una `Trajectory` lazy o su un singolo `Atoms`.
 - Opzionalmente calcola RDF parziali per tutte le coppie di specie o per `species_pairs`.
 - Processa posizioni/celle a batch.
-- Usa backend Numba se disponibile, altrimenti fallback NumPy.
+- Usa esclusivamente kernel Numba per gli istogrammi (Numba obbligatorio).
 
 Contratti/assunzioni:
 - Ogni frame deve avere posizioni shape `(natoms, 3)` e cella `(3, 3)`.
@@ -297,8 +296,8 @@ Contratti/assunzioni:
 - Per input `Atoms`, `g_r` e ciascuna RDF parziale hanno shape `(n_bins,)`; per input `Trajectory` hanno shape `(n_frames, n_bins)`.
 - Normalizzazione frame-by-frame con il volume della cella del frame.
 
-Dipendenze interne:
-- usa `helpers.periodic.minimum_image_distances` nel fallback NumPy.
+Dipendenze:
+- usa `numba.njit` e `numba.prange` per gli istogrammi, con minimum-image calcolata nei kernel.
 
 ### `helpers/periodic.py`
 
@@ -360,18 +359,18 @@ Contratti/assunzioni:
 
 API:
 - `velocity_autocorrelation(trajectory, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, time_step=None, batch_size=100) -> NDArray | tuple[NDArray, NDArray]`, restituisce `vacf` oppure `(time, vacf)` se `time_step` è fornito
-- `vibrational_density_of_states(data, time_step, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, batch_size=100, gaussian_filter_width=None) -> tuple[NDArray, NDArray]`, con `data` = `Trajectory | array VACF | tuple(time, vacf)`; restituisce `(frequency, spectrum)`
-- `calculate_vdos(corr_values, time_step, gaussian_filter_width=None) -> tuple[NDArray, NDArray]`
+- `vibrational_density_of_states(data, time_step, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, batch_size=100, gaussian_filter_width=None, method="fft") -> tuple[NDArray, NDArray]`, con `data` = `Trajectory | array VACF | tuple(time, vacf)`; restituisce `(frequency, spectrum)`
+- `calculate_vdos(corr_values, time_step, gaussian_filter_width=None, method="fft") -> tuple[NDArray, NDArray]`
 
 Responsabilità:
 - calcolo della velocity autocorrelation function via FFT da sequenze lazy di frame.
-- trasformata coseno di Filon per ottenere VDOS/spettri vibrazionali da una `Trajectory` o da una VACF già calcolata.
+- trasformata coseno veloce via FFT per ottenere VDOS/spettri vibrazionali da una `Trajectory` o da una VACF già calcolata; backend Filon legacy disponibile con `method="filon"`.
 - selezione opzionale di gruppi atomici tramite array di appartenenza per-atomo (`atom_groups`) e label `group`, rimozione velocità del centro di massa e pesatura in massa.
 
 Contratti/assunzioni:
 - velocità in unità interne Å/fs; `time_step` in fs; asse spettrale restituito sempre in `cm^-1` usando frequenze in ps^-1/THz.
 - per la VACF via FFT le velocità selezionate vengono materializzate in array `(n_frames, n_atoms, 3)`.
-- `numba` è opzionale per la trasformata di Filon; fallback Python disponibile.
+- `method="fft"` è il default veloce O(N log N); `method="filon"` è legacy O(N²), parallelizzato con `numba.prange` (Numba obbligatorio, nessun fallback Python).
 
 ## 7. Punti di attenzione / debito tecnico
 
@@ -445,3 +444,11 @@ Per nuovi moduli I/O, specifica sempre:
    - `src/isse/io/parse_vasp.py`
    - `src/isse/convert.py`
 6. Prima di refactor importanti, introdurre test minimi su `Atoms`, `Trajectory`, parser, shape degli array, RDF/PBC e output di `calculate_temperature`.
+
+
+## RDF: kernel unificato
+
+- `calculate_rdf` usa un solo `_histogram_rdf_numba` per accumulare totale e parziali nello stesso attraversamento delle coppie; le distanze minimum-image non vengono ricalcolate per le parziali.
+- Il totale include anche coppie non selezionate in `species_pairs`. Il kernel restituisce `(counts, partial_counts)`; senza parziali, il secondo array ha shape `(nframes, 0, nbins)`.
+- I frame mantengono istogrammi separati per il parallelismo Numba. Normalizzazione e API pubblica restano invariate.
+- Test di regressione versionabili in `tests/test_radial_distribution.py`; esecuzione: `python -m unittest discover -s tests -v`.

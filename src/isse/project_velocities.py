@@ -7,12 +7,7 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-try:
-    from numba import njit, prange
-
-    NUMBA_AVAILABLE = True
-except ImportError:
-    NUMBA_AVAILABLE = False
+from numba import njit, prange
 
 from .helpers.cell_mapping import map_atoms_to_primitive
 from .io.parse_alamode import read_alamode_evec
@@ -182,97 +177,18 @@ def _iter_velocity_batches(
         yield np.ascontiguousarray(batch, dtype=np.float64)
 
 
-if NUMBA_AVAILABLE:
-
-    @njit(cache=True, parallel=True)
-    def _project_batch_numba(
-        velocities: NDArray[np.float64],
-        masses: NDArray[np.float64],
-        coefficients: NDArray[np.complex128],
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """
-        Project atomic velocities onto phonon modes using the Numba backend.
-
-        The projection is evaluated independently for each trajectory frame,
-        q-point, and phonon mode. Frames are processed in parallel using
-        ``numba.prange``.
-
-        For each mode, the function computes the squared modulus of the
-        mass-weighted projected velocity. It also computes the mass-weighted
-        Cartesian velocity norm of each frame, which can be used to verify the
-        completeness and normalization of the modal decomposition.
-
-        Parameters
-        ----------
-        velocities : numpy.ndarray
-            Cartesian atomic velocities with shape
-            ``(nframes, natoms, 3)``.
-        masses : numpy.ndarray
-            Atomic masses with shape ``(natoms,)``.
-        coefficients : numpy.ndarray
-            Complex frame-independent projection coefficients with shape
-            ``(nqpoints, nmodes, natoms, 3)``.
-
-        Returns
-        -------
-        qdot2 : numpy.ndarray
-            Squared moduli of the projected modal velocities, with shape
-            ``(nframes, nqpoints, nmodes)`` and dtype ``float64``.
-        atomic_norms : numpy.ndarray
-            Mass-weighted Cartesian velocity norm for each frame, with shape
-            ``(nframes,)`` and dtype ``float64``.
-        """
-
-        nframes, natoms, _ = velocities.shape
-        nq, nmodes, _, _ = coefficients.shape
-
-        qdot2 = np.empty((nframes, nq, nmodes), dtype=np.float64)
-        atomic_norms = np.empty(nframes, dtype=np.float64)
-
-        for iframe in prange(nframes):
-            atomic_norm = 0.0
-
-            for iatom in range(natoms):
-                vx = velocities[iframe, iatom, 0]
-                vy = velocities[iframe, iatom, 1]
-                vz = velocities[iframe, iatom, 2]
-                atomic_norm += masses[iatom] * (vx * vx + vy * vy + vz * vz)
-
-            atomic_norms[iframe] = atomic_norm
-
-            for iq in range(nq):
-                for imode in range(nmodes):
-                    qreal = 0.0
-                    qimag = 0.0
-
-                    for iatom in range(natoms):
-                        vx = velocities[iframe, iatom, 0]
-                        vy = velocities[iframe, iatom, 1]
-                        vz = velocities[iframe, iatom, 2]
-
-                        cx = coefficients[iq, imode, iatom, 0]
-                        cy = coefficients[iq, imode, iatom, 1]
-                        cz = coefficients[iq, imode, iatom, 2]
-
-                        qreal += cx.real * vx + cy.real * vy + cz.real * vz
-                        qimag += cx.imag * vx + cy.imag * vy + cz.imag * vz
-
-                    qdot2[iframe, iq, imode] = qreal * qreal + qimag * qimag
-
-        return qdot2, atomic_norms
-
-
-def _project_batch_numpy(
+@njit(cache=True, parallel=True)
+def _project_batch_numba(
     velocities: NDArray[np.float64],
     masses: NDArray[np.float64],
     coefficients: NDArray[np.complex128],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
-    Project atomic velocities onto phonon modes using the NumPy backend.
+    Project atomic velocities onto phonon modes using Numba.
 
     The projection is evaluated independently for each trajectory frame,
-    q-point, and phonon mode. The contraction over atoms and Cartesian
-    components is fully vectorized using ``numpy.einsum``.
+    q-point, and phonon mode. Frames are processed in parallel using
+    ``numba.prange``.
 
     For each mode, the function computes the squared modulus of the
     mass-weighted projected velocity. It also computes the mass-weighted
@@ -299,23 +215,41 @@ def _project_batch_numpy(
         Mass-weighted Cartesian velocity norm for each frame, with shape
         ``(nframes,)`` and dtype ``float64``.
     """
+    nframes, natoms, _ = velocities.shape
+    nq, nmodes, _, _ = coefficients.shape
 
-    atomic_norms = np.einsum(
-        "a,fad->f",
-        masses,
-        velocities**2,
-        optimize=True,
-    )
+    qdot2 = np.empty((nframes, nq, nmodes), dtype=np.float64)
+    atomic_norms = np.empty(nframes, dtype=np.float64)
 
-    q = np.einsum(
-        "qmad,fad->fqm",
-        coefficients,
-        velocities,
-        optimize=True,
-    )
+    for iframe in prange(nframes):
+        atomic_norm = 0.0
 
-    qdot2 = (q.real**2 + q.imag**2).astype(np.float64)
-    atomic_norms = atomic_norms.astype(np.float64)
+        for iatom in range(natoms):
+            vx = velocities[iframe, iatom, 0]
+            vy = velocities[iframe, iatom, 1]
+            vz = velocities[iframe, iatom, 2]
+            atomic_norm += masses[iatom] * (vx * vx + vy * vy + vz * vz)
+
+        atomic_norms[iframe] = atomic_norm
+
+        for iq in range(nq):
+            for imode in range(nmodes):
+                qreal = 0.0
+                qimag = 0.0
+
+                for iatom in range(natoms):
+                    vx = velocities[iframe, iatom, 0]
+                    vy = velocities[iframe, iatom, 1]
+                    vz = velocities[iframe, iatom, 2]
+
+                    cx = coefficients[iq, imode, iatom, 0]
+                    cy = coefficients[iq, imode, iatom, 1]
+                    cz = coefficients[iq, imode, iatom, 2]
+
+                    qreal += cx.real * vx + cy.real * vy + cz.real * vz
+                    qimag += cx.imag * vx + cy.imag * vy + cz.imag * vz
+
+                qdot2[iframe, iq, imode] = qreal * qreal + qimag * qimag
 
     return qdot2, atomic_norms
 
@@ -417,8 +351,6 @@ def project_velocities(
         masses,
     )
 
-    backend = _project_batch_numba if NUMBA_AVAILABLE else _project_batch_numpy
-
     qdot2_batches: list[NDArray[np.float64]] = []
     atomic_norm_batches: list[NDArray[np.float64]] = []
     parseval_error_batches: list[NDArray[np.float64]] = []
@@ -429,7 +361,7 @@ def project_velocities(
         natoms=len(reference_atoms),
         batch_size=batch_size,
     ):
-        qdot2_batch, atomic_norms_batch = backend(
+        qdot2_batch, atomic_norms_batch = _project_batch_numba(
             velocities,
             masses,
             coefficients,

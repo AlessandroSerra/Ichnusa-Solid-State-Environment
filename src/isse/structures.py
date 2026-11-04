@@ -196,7 +196,7 @@ class Trajectory(Sequence[Atoms]):
     True
     """
 
-    __slots__ = ("_paths", "_offsets", "_reader", "_cumulative")
+    __slots__ = ("_cumulative", "_offsets", "_paths", "_reader")
 
     def __init__(
         self,
@@ -228,7 +228,9 @@ class Trajectory(Sequence[Atoms]):
             if not path.is_file():
                 raise FileNotFoundError(path)
 
-        if any(offset < 0 for frame_offsets in self._offsets for offset in frame_offsets):
+        if any(
+            offset < 0 for frame_offsets in self._offsets for offset in frame_offsets
+        ):
             raise ValueError("frame offsets must be non-negative")
 
         cumulative: list[int] = []
@@ -257,7 +259,9 @@ class Trajectory(Sequence[Atoms]):
         Multi-file trajectories have no single path; use :attr:`paths` instead.
         """
         if len(self._paths) != 1:
-            raise AttributeError("multi-file trajectories have multiple paths; use paths")
+            raise AttributeError(
+                "multi-file trajectories have multiple paths; use paths"
+            )
         return self._paths[0]
 
     @property
@@ -330,7 +334,9 @@ class Trajectory(Sequence[Atoms]):
             return NotImplemented
 
         if not _same_reader(self._reader, other._reader):
-            raise ValueError("can only concatenate trajectories with compatible readers")
+            raise ValueError(
+                "can only concatenate trajectories with compatible readers"
+            )
 
         return Trajectory._from_parts(
             paths=self._paths + other._paths,
@@ -350,10 +356,11 @@ class Trajectory(Sequence[Atoms]):
 
     def __repr__(self) -> str:
         if len(self._paths) == 1:
-            return f"{type(self).__name__}(path={str(self.path)!r}, n_frames={len(self)})"
+            return (
+                f"{type(self).__name__}(path={str(self.path)!r}, n_frames={len(self)})"
+            )
         return (
-            f"{type(self).__name__}("
-            f"n_files={len(self._paths)}, n_frames={len(self)})"
+            f"{type(self).__name__}(n_files={len(self._paths)}, n_frames={len(self)})"
         )
 
     def __str__(self) -> str:
