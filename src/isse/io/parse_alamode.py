@@ -87,6 +87,8 @@ def read_alamode_evec(
     while i < len(lines):
         k_match = kpoint_re.match(lines[i])
         if k_match:
+            if iq >= 0 and imode != nmodes:
+                raise ValueError("Incomplete mode block in ALAMODE file.")
             iq += 1
             imode = 0
             if iq >= nq:
@@ -112,6 +114,8 @@ def read_alamode_evec(
 
         i += 1
 
+    if imode != nmodes:
+        raise ValueError("Incomplete mode block in ALAMODE file.")
     if iq + 1 != nq:
         raise ValueError(f"Read {iq + 1} q-points; expected {nq}.")
 

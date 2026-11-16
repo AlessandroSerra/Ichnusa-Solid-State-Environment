@@ -13,7 +13,7 @@ The project provides lightweight atomistic data structures, lazy trajectory I/O,
 - Native readers and writers for selected VASP, LAMMPS, and GPUMD/extended-XYZ files.
 - Explicit unit handling for LAMMPS `metal` and `real` unit styles.
 - Dependency-light conversion utilities without ASE.
-- Phonon modal temperature workflow using ALAMODE eigenvector files.
+- Phonon velocity/displacement projection and modal temperatures from legacy ALAMODE files, NumPy arrays, or the ALAMODE 2.0 Python API; optional complex modal velocities and normal coordinates.
 - Radial distribution function calculation using Numba.
 - Velocity autocorrelation and vibrational density of states utilities.
 - Periodic-boundary utilities for wrapping, unwrapping, and minimum-image distances.
@@ -40,7 +40,14 @@ Runtime dependencies are:
 - `spglib`
 - `numba`
 
-Numba is required for the velocity projection, RDF, and Filon transform implementations; no NumPy fallback is provided.
+Numba is required at runtime for the projection, RDF, and Filon implementations.
+Normal-mode projection uses Numba exclusively; there is no NumPy fallback or
+backend-selection argument.
+
+Source-independent phonon data uses ISSE's own `Atoms` structure and needs no
+additional dependencies. ALAMODE is installed separately and is not required
+for legacy files or NumPy-array phonon inputs; ASE is not required for any
+phonon projection interface.
 
 ## Internal unit convention
 
@@ -293,9 +300,64 @@ Requirements for this workflow:
 - The ALAMODE `.evec` file is read by `isse.io.parse_alamode.read_alamode_evec`.
 - A Parseval consistency check is performed by default; pass `parseval_tolerance=None` to disable it.
 
+### Source-independent phonons and complex modal velocities
+
+Use `PhononModes` to supply arrays directly, read an `.evec` with an explicitly
+ordered primitive, or adapt `anphon.Phonon` without ISSE-generated intermediate
+files. Both `project_velocities` and `calculate_temperature` accept `modes=`.
+
+```python
+from isse import PhononModes, project_velocities
+
+# ph is anphon.Phonon("harmonic.h5"). primitive is an isse.structures.Atoms object
+# whose order, basis images and masses have been checked against ALAMODE.
+modes = PhononModes.from_anphon(
+    ph, [[0, 0, 0]], primitive=primitive, source_order_confirmed=True,
+)
+q, squared, norms, deficits, complex_velocity = project_velocities(
+    trajectory, reference, modes=modes,
+    return_complex=True, parseval_tolerance=None,
+)
+```
+
+Gamma-only projections in a multi-cell supercell are incomplete: disable
+Parseval validation explicitly; no partial-basis renormalization is applied.
+Complex velocities have units sqrt(amu) Å/fs; their squared moduli are not total
+harmonic energies. Eigenvector phases and degenerate-subspace rotations affect
+individual modal amplitudes.
+
+See [the projection guide](docs/phonon_projection.md) for complete examples,
+array shapes, normalization, phase/ordering conventions, source verification,
+partial-basis interpretation, and test instructions.
+
+### Displacement projection
+
+Project deviations from the same fixed equilibrium reference onto normal
+coordinates, using the same phonon data and shared Numba projection engine:
+
+```python
+from isse import project_displacements
+
+q, q2, norms, deficits, Q = project_displacements(
+    trajectory, reference, modes=modes,
+    return_complex=True, parseval_tolerance=None,  # Gamma-only / partial basis
+    position_mode="minimum_image",
+)
+```
+
+`Q` has units sqrt(amu) Å; `q2 = abs(Q)**2` is not an energy. Both have shape
+`(nframes, nq, nmodes)`. Velocities are not required. Default displacements
+are minimum-image differences from the reference, using the supercell.
+Use `position_mode="unwrapped"` for explicit, image-aligned unwrapped positions,
+or `"cartesian"` for direct differences without image correction. Variable
+cells are rejected; no COM translation, rotation or strain is removed.
+See the [projection guide](docs/phonon_projection.md#displacement-projection--complex-normal-coordinates)
+for image conventions, completeness checks and phase limitations.
+
 ## Development notes
 
-The public API is currently module-based; import from the specific modules shown above. The top-level `isse` package does not yet re-export a stable aggregate API.
+Public workflows, including `PhononModes`, `project_velocities`,
+`project_displacements`, and `calculate_temperature`, are also available from the top-level `isse` package.
 
 Recommended checks while developing:
 

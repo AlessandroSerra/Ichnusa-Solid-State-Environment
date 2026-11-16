@@ -33,13 +33,15 @@ src/isse/
 ├── constants.py              # costanti fisiche, conversioni unità, masse atomiche
 ├── structures.py             # Atoms e Trajectory lazy anche multi-file
 ├── phonon_temperatures.py    # entry point alto livello per temperature modali
-├── project_velocities.py     # proiezione velocità su modi fononici
+├── project_velocities.py     # validazione/batching velocità e workflow pubblico
+├── project_displacements.py  # proiezione spostamenti dalla reference su coordinate normali
 ├── convert_file.py           # CLI/converter ASE con test di equivalenza
 ├── convert.py                # converter ISSE-native senza ASE, non tracciato
 ├── radial_distribution.py    # RDF totale su Trajectory lazy
 ├── spectral.py               # VACF e VDOS/spettri vibrazionali
 ├── helpers/
 │   ├── cell_mapping.py       # mapping atomi supercella -> cella primitiva + basis
+│   ├── mode_projection.py    # motore condiviso interno, kernel Numba obbligatorio
 │   ├── periodic.py           # wrap/unwrap e minimum-image in PBC
 │   └── symmetry.py           # scaled positions, primitive cell via spglib, qpoint helpers
 └── io/
@@ -136,6 +138,16 @@ Output dict attuale:
 - opzionale `selected_mode_temperatures`, shape `(nframes, nselected, nmodes)`
 
 Nota: `reconstructed_temperature` viene calcolata e loggata, ma non inserita in `results`; la docstring è stata aggiornata per riflettere l'output effettivo.
+
+### 5.4 Coordinate normali da spostamenti
+
+```text
+Trajectory (positions/unwrapped_positions) + reference Atoms + PhononModes/.evec
+    └─ project_displacements(..., position_mode=...)
+         ├─ _iter_displacement_batches: u = r - r_reference, con gestione immagini esplicita
+         └─ helpers.mode_projection._project_vectors: mapping, coefficienti, kernel Numba e Parseval condivisi
+              └─ qpoints, |Q|², sum(m|u|²), errori, opzionale Q complesso
+```
 
 ## 6. Moduli e responsabilità
 
@@ -248,21 +260,57 @@ Responsabilità:
 - Restituisce `(cell_indices, basis_indices), residuals`.
 - Verifica residui e popolazioni per sito di basis.
 
+### `phonon_modes.py`
+
+API pubblica:
+- `PhononModes(primitive, qpoints, frequencies, eigenvectors)` con primitive `isse.structures.Atoms` (nessuna dipendenza ASE o extra), q ridotti `(nq, 3)`, frequenze cm⁻¹ `(nq, nmodes)`, autovettori complessi ortonormali `(nq, nmodes, nprim, 3)`.
+- `PhononModes.from_evec(filename, primitive=...)`: ordine primitive esplicito; converte autovalori signed omega² Ry in cm⁻¹.
+- `PhononModes.from_anphon(ph, qpoints, primitive=..., source_order_confirmed=True)`: API ALAMODE 2.0; nessun import obbligatorio di anphon.
+
+Contratti:
+- primitive nell'ordine, masse e immagini della sorgente, gauge Bloch con sole traslazioni di cella. L'API anphon non espone metadata primitive: la conferma dell'utente è obbligatoria, non si deduce l'ordine dalle shape.
+- Validazione shape, finitezza, masse esplicite positive e ortonormalità; nessuna rinormalizzazione silenziosa né inferenza delle masse dai simboli. Copia indipendente della primitive e degli array.
+- Documentazione/verifica sorgenti ufficiali: `docs/phonon_projection.md`; regressioni sintetiche: `tests/test_phonon_projection.py`.
+
+### `helpers/mode_projection.py`
+
+Responsabilità (API interna, non riesportata da `helpers/__init__.py`):
+- `_project_vectors(..., *, vector_batches, modes=None, return_complex=False)`: mapping, masse, coefficienti, orchestrazione batch e Parseval. L'iteratore di vettori cartesiani è obbligatorio; nessuna lettura implicita di velocità/spostamenti dalla trajectory.
+- `_precompute_coefficients(...)`, `_compute_parseval_errors(squared_moduli, atomic_norms)` e `_project_batch_numba(...)` condivisi dai workflow.
+- Nomi generici (`vectors`, `modal_values`, `squared_moduli`); unità determinate dai vettori forniti. Numba obbligatorio, nessun kernel NumPy o fallback, nessun parametro `backend`.
+- Test architetturali in `tests/test_mode_projection.py` e regressioni analitiche nei test dei workflow.
+
 ### `project_velocities.py`
 
 API principale:
-- `project_velocities(trajectory, reference_atoms, evec_filepath, batch_size=100, parseval_tolerance=1e-6)`
+- `project_velocities(trajectory, reference_atoms, evec_filepath=None, batch_size=100, parseval_tolerance=1e-6, *, modes=None, return_complex=False)`
+- `evec_filepath` può anche essere un `PhononModes`; default conserva i quattro output storici, `return_complex=True` aggiunge qdot complesso come quinto output (sqrt(amu) Å/fs).
+- Kernel Numba obbligatorio a batch tramite `helpers/mode_projection.py`; coefficienti e convenzione di fase invariati. Input modes usa il mapping esplicito source-ordered con validazione specie/masse e supercella; il percorso file-only mantiene spglib per retrocompatibilità.
+- Basi parziali/Gamma-only richiedono `parseval_tolerance=None`; nessuna rinormalizzazione. Per basi complete si verificano anche ortogonalità/commensurabilità dei qpoints.
+- `calculate_temperature` accetta anch'esso `modes=`; nessun parametro `backend`.
 
-Helper:
-- `_compute_parseval_errors(qdot2, atomic_norms)`
-- `_precompute_coefficients(qpoints, eigenvectors, cell_indices, basis_indices, masses)`
-- `_iter_velocity_batches(trajectory, natoms, batch_size)`
-- `_project_batch_numba(...)` (Numba obbligatorio)
+Helper locale:
+- `_iter_velocity_batches(trajectory, natoms, batch_size)`; l'orchestrazione è importata da `helpers.mode_projection`.
 
 Contratti importanti:
-- `reference_atoms.masses` deve essere presente.
+- Masse da `reference_atoms` o dal primo frame della trajectory; finite e positive. Con `PhononModes` devono coincidere con quelle della primitive.
 - Ogni frame della trajectory deve contenere `velocities` shape `(natoms, 3)`.
-- `parseval_tolerance` può essere `None` a runtime, anche se type hint attuale è `float`.
+- `parseval_tolerance: float | None`; `None` disabilita la validazione per proiezioni parziali.
+
+### `project_displacements.py`
+
+API pubblica:
+- `project_displacements(trajectory, reference_atoms, evec_filepath=None, batch_size=100, parseval_tolerance=1e-6, *, modes=None, return_complex=False, position_mode="minimum_image")`.
+- Stessi input fononici, mapping, coefficienti e kernel Numba di `project_velocities`, importati da `helpers.mode_projection`; nessuna dipendenza fra i due workflow, nessuna nuova dipendenza esterna.
+- Output `(qpoints, q2, atomic_norms, parseval_errors)`; `return_complex=True` aggiunge Q complesso `(nframes, nq, nmodes)` in sqrt(amu) Å. q2 e norme in amu Å², non energie.
+
+Contratti/assunzioni:
+- Reference di equilibrio fissa e frame nello stesso ordine/specie; celle uguali entro 1e-8 Å. Celle variabili rifiutate, nessuna sottrazione implicita di COM, rotazione o strain.
+- `minimum_image`: differenze posizioni rispetto alla reference con MIC nella supercella, non nella primitiva; escursioni < metà box in coordinate frazionarie. Limite MIC su celle fortemente skewed come helper esistente.
+- `unwrapped`: richiede `frame.unwrapped_positions`; sottrae reference.unwrapped_positions se presente, altrimenti reference.positions. Origini delle immagini devono essere coerenti, nessuna correzione automatica.
+- `cartesian`: differenza diretta di positions, senza MIC.
+- Basi parziali richiedono `parseval_tolerance=None`, senza rinormalizzazione. Qdot = dQ/dt solo a reference/basis fissa e immagini continue.
+- Test sintetici in `tests/test_displacement_projection.py`; doc in `docs/phonon_projection.md`.
 
 ### `phonon_temperatures.py`
 
@@ -377,7 +425,7 @@ Contratti/assunzioni:
 Questa sezione va aggiornata man mano che il codice evolve.
 
 1. **TODO esistente** (`src/isse/TODO.md`):
-   - in `calculate_temperature`, se `reference_atoms` non ha masse, oggi viene sollevata eccezione; desiderato: prenderle dalla trajectory.
+   - fallback masse dal primo frame implementato in `project_velocities` (usato anche da `calculate_temperature`).
    - TODO dice anche che `calculate_temperature` dovrebbe restituire i qpoints, ma il codice attuale li include già in `results["qpoints"]`.
 2. **API package parzialmente esposta**: gli `__init__.py` espongono funzioni/workflow principali, parser/writer e helper stabili; `Atoms` e `Trajectory` restano importabili da `isse.structures` per uso avanzato/test.
 3. **Assenza test**: nessuna suite test versionata. Priorità alta per parser, unità, shape, lazy loading, Parseval.
@@ -393,7 +441,7 @@ Questa sezione va aggiornata man mano che il codice evolve.
    - typo in messaggi tipo `Succesfully`.
    - in `phonon_temperatures.py` il messaggio `logger.info` sembra mancare una parentesi `)` nel testo formattato.
 10. **Type hints**:
-   - `parseval_tolerance` documentato come opzionale/`None`, ma annotato `float`.
+   - `parseval_tolerance` ora annotato `float | None` in proiezione e temperature.
    - alcuni return/import usano `np.ndarray` generico invece di `NDArray[...]`.
 
 ## 8. Come estendere questa mappa

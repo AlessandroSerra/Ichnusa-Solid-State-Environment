@@ -7,6 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .constants import AMU_A2_FS2_TO_EV, KB_EV_K
+from .phonon_modes import PhononModes
 from .project_velocities import project_velocities
 from .structures import Atoms, Trajectory
 
@@ -16,10 +17,12 @@ logger = getLogger(__name__)
 def calculate_temperature(
     trajectory: Trajectory,
     reference_atoms: Atoms,
-    evec_filepath: str | Path,
+    evec_filepath: str | Path | PhononModes | None = None,
     selected_iqs: NDArray[np.int32] | None = None,
     batch_size: int = 100,
-    parseval_tolerance: float = 1e-6,
+    parseval_tolerance: float | None = 1e-6,
+    *,
+    modes: PhononModes | None = None,
 ) -> dict[str, NDArray[np.float64] | float]:
     """
     Project a trajectory onto phonon modes and compute modal temperatures.
@@ -34,8 +37,12 @@ def calculate_temperature(
     reference_atoms : Atoms
         Reference structure corresponding to the supercell used for the
         molecular dynamics simulation.
-    evec_filepath : str or pathlib.Path
-        Path to the ALAMODE eigenvector file.
+    evec_filepath : str, pathlib.Path or PhononModes, optional
+        Legacy file or source-independent phonons.
+    modes : PhononModes, optional
+        Explicit ordered phonon data, instead of evec_filepath. Partial
+        projections require parseval_tolerance=None; their temperatures are
+        kinetic-equivalent quantities, not a reconstructed system temperature.
     selected_iqs : numpy.ndarray, optional
         Indices of q-points for which the instantaneous modal temperature
         time series is also returned. The default is ``None`` (skipped).
@@ -71,6 +78,7 @@ def calculate_temperature(
         evec_filepath,
         batch_size=batch_size,
         parseval_tolerance=parseval_tolerance,
+        modes=modes,
     )
 
     natoms = len(reference_atoms)
@@ -78,10 +86,16 @@ def calculate_temperature(
     mean_qdot2 = qdot2.mean(axis=0)
     mode_temperatures = mean_qdot2 * AMU_A2_FS2_TO_EV / KB_EV_K
 
-    gamma_index = 0
     thermal_mask = np.ones_like(mode_temperatures, dtype=bool)
-    thermal_mask[gamma_index, :3] = False
-    mean_mode_temperature = float(mode_temperatures[thermal_mask].mean())
+    gamma = np.all(np.isclose(qpoints, np.rint(qpoints), atol=1e-8), axis=1)
+    # As in the legacy workflow, the first three Gamma modes are assumed
+    # acoustic. Arbitrarily selected mode subsets cannot use this average.
+    thermal_mask[gamma, :3] = False
+    mean_mode_temperature = (
+        float(mode_temperatures[thermal_mask].mean())
+        if thermal_mask.any()
+        else float("nan")
+    )
 
     ndof = 3 * natoms - 3
     reconstructed_temperature = float(
@@ -92,9 +106,14 @@ def calculate_temperature(
 
     relative_temperature_difference = (
         abs(mean_mode_temperature - reconstructed_temperature) / mean_mode_temperature
+        if mean_mode_temperature > 0
+        else float("nan")
     )
 
-    if relative_temperature_difference > temperature_rtol:
+    if (
+        parseval_tolerance is not None
+        and relative_temperature_difference > temperature_rtol
+    ):
         logger.warning(
             "Potential residual drift present in the trajectory. "
             "Mean thermal mode temperature and reconstructed temperature differ "
@@ -119,7 +138,15 @@ def calculate_temperature(
                 qdot2[:, selected_iqs, :] * AMU_A2_FS2_TO_EV / KB_EV_K
             )
 
+    label = (
+        "Reconstructed temperature"
+        if parseval_tolerance is not None
+        else "Projected kinetic-equivalent temperature contribution (not a system temperature)"
+    )
+    finite_errors = parseval_errors[np.isfinite(parseval_errors)]
+    max_error = float(finite_errors.max()) if finite_errors.size else float("nan")
     logger.info(
-        f"Reconstructed temperature: {reconstructed_temperature:.2f} K (mean thermal mode: {mean_mode_temperature:.2f} K, max Parseval error: {np.nanmax(parseval_errors):.3e}"
+        f"{label}: {reconstructed_temperature:.2f} K (mean thermal mode: "
+        f"{mean_mode_temperature:.2f} K, max Parseval error: {max_error:.3e})"
     )
     return results

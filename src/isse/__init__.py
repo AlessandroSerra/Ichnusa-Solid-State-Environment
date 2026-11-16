@@ -16,7 +16,9 @@ from .constants import (
     symbol_from_mass,
     symbols_from_masses,
 )
+from .phonon_modes import PhononModes
 from .phonon_temperatures import calculate_temperature
+from .project_displacements import project_displacements
 from .project_velocities import project_velocities
 from .radial_distribution import calculate_rdf
 from .spectral import (
@@ -34,14 +36,16 @@ __all__ = [
     "KB_EV_K",
     "KCAL_MOL_TO_EV",
     "PS_TO_FS",
+    "PhononModes",
     "calculate_rdf",
     "calculate_temperature",
     "calculate_vdos",
     "mass_from_symbol",
     "masses_from_symbols",
+    "project_displacements",
     "project_velocities",
     "symbol_from_mass",
+    "symbols_from_masses",
     "velocity_autocorrelation",
     "vibrational_density_of_states",
-    "symbols_from_masses",
 ]
