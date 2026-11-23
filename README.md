@@ -296,9 +296,11 @@ print(results["mean_mode_temperature"])
 Requirements for this workflow:
 
 - The trajectory frames must include velocities in Å/fs.
-- `reference_atoms.masses` must be available.
+- Masses must be available in the reference or first frame. Frame masses are otherwise optional; any supplied masses must agree with the projection masses.
+- Every frame must match the reference species sequence and fixed cell (absolute tolerance 1e-8 Å). Species checks cannot detect permutations of same-element atoms; stable atomic identity/order is the caller's responsibility.
 - The ALAMODE `.evec` file is read by `isse.io.parse_alamode.read_alamode_evec`.
-- A Parseval consistency check is performed by default; pass `parseval_tolerance=None` to disable it.
+- A Parseval consistency check is performed by default; pass `parseval_tolerance=None` to disable completeness checking, not numerical-integrity checks. Non-finite results always raise an error; valid zero-norm frames retain NaN relative errors.
+- For partial Gamma mode lists, `calculate_temperature` retains all supplied modes and logs a warning instead of guessing acoustic indices. Complete mode lists keep the legacy first-three-acoustic assumption.
 
 ### Source-independent phonons and complex modal velocities
 

@@ -62,8 +62,10 @@ def calculate_temperature(
           ``(nqpoints, 3)``.
         - ``"mode_temperatures"``: modal kinetic temperatures, shape
           ``(nqpoints, nmodes)``.
-        - ``"mean_mode_temperature"``: modal temperature averaged over all
-          modes except the acoustic modes at Gamma.
+        - ``"mean_mode_temperature"``: for complete mode lists, excludes the
+          first three modes at Gamma (legacy acoustic-first assumption). For
+          partial mode lists, includes all supplied modes because acoustic
+          identities are unknown, and logs a warning when Gamma is present.
         - ``"selected_mode_temperatures"``: instantaneous modal
           temperature time series at ``selected_iqs``, shape
           ``(nframes, nselected, nmodes)``. Present only if
@@ -72,7 +74,7 @@ def calculate_temperature(
         ``reconstructed_temperature`` is computed internally and logged, but
         is not currently included in the returned dictionary.
     """
-    qpoints, qdot2, _, parseval_errors = project_velocities(
+    qpoints, qdot2, atomic_norms, parseval_errors = project_velocities(
         trajectory,
         reference_atoms,
         evec_filepath,
@@ -88,9 +90,19 @@ def calculate_temperature(
 
     thermal_mask = np.ones_like(mode_temperatures, dtype=bool)
     gamma = np.all(np.isclose(qpoints, np.rint(qpoints), atol=1e-8), axis=1)
-    # As in the legacy workflow, the first three Gamma modes are assumed
-    # acoustic. Arbitrarily selected mode subsets cannot use this average.
-    thermal_mask[gamma, :3] = False
+    phonon_modes = modes if modes is not None else evec_filepath
+    complete_mode_set = True
+    if isinstance(phonon_modes, PhononModes):
+        complete_mode_set = qdot2.shape[2] == 3 * len(phonon_modes.primitive)
+    # Only complete mode lists retain the legacy acoustic-first assumption.
+    # A partial list has no source mode indices: its first entries may be optical.
+    if complete_mode_set:
+        thermal_mask[gamma, :3] = False
+    elif np.any(gamma):
+        logger.warning(
+            "Partial Gamma mode set: acoustic mode identities are unknown; "
+            "retaining all supplied modes in mean_mode_temperature."
+        )
     mean_mode_temperature = (
         float(mode_temperatures[thermal_mask].mean())
         if thermal_mask.any()
@@ -143,8 +155,8 @@ def calculate_temperature(
         if parseval_tolerance is not None
         else "Projected kinetic-equivalent temperature contribution (not a system temperature)"
     )
-    finite_errors = parseval_errors[np.isfinite(parseval_errors)]
-    max_error = float(finite_errors.max()) if finite_errors.size else float("nan")
+    nonzero_errors = parseval_errors[atomic_norms != 0.0]
+    max_error = float(nonzero_errors.max()) if nonzero_errors.size else float("nan")
     logger.info(
         f"{label}: {reconstructed_temperature:.2f} K (mean thermal mode: "
         f"{mean_mode_temperature:.2f} K, max Parseval error: {max_error:.3e})"

@@ -24,6 +24,51 @@ from .symmetry import get_scaled_positions
 logger = getLogger(__name__)
 
 
+def _iter_validated_frames(
+    trajectory: Trajectory,
+    reference_atoms: Atoms,
+) -> Iterator[Atoms]:
+    """Validate common frame metadata before either workflow reads vectors.
+
+    Species cannot identify permutations between atoms of the same element;
+    callers must maintain reference atom identity/order. Frame masses are
+    optional, but when supplied must agree with the projection masses (from
+    the reference, or the first frame when reference masses are absent).
+    """
+    projection_masses = reference_atoms.masses
+    reference_cell = np.asarray(reference_atoms.cell, dtype=np.float64)
+    for iframe, atoms in enumerate(trajectory):
+        if not np.array_equal(atoms.symbols, reference_atoms.symbols):
+            raise ValueError(
+                f"Trajectory frame {iframe} symbols must match reference atom order"
+            )
+        cell = np.asarray(atoms.cell, dtype=np.float64)
+        if (
+            cell.shape != (3, 3)
+            or not np.isfinite(cell).all()
+            or not np.allclose(cell, reference_cell, atol=1e-8, rtol=0)
+        ):
+            raise ValueError(
+                f"Trajectory frame {iframe} cell differs from the fixed reference cell"
+            )
+        if iframe == 0 and projection_masses is None:
+            projection_masses = atoms.masses
+        if atoms.masses is not None:
+            frame_masses = np.asarray(atoms.masses, dtype=np.float64)
+            if (
+                frame_masses.shape != (len(reference_atoms),)
+                or not np.isfinite(frame_masses).all()
+                or np.any(frame_masses <= 0)
+                or not np.allclose(
+                    frame_masses, projection_masses, atol=1e-6, rtol=1e-6
+                )
+            ):
+                raise ValueError(
+                    f"Trajectory frame {iframe} masses must match the projection masses"
+                )
+        yield atoms
+
+
 def _compute_parseval_errors(
     squared_moduli: NDArray[np.float64],
     atomic_norms: NDArray[np.float64],
@@ -32,13 +77,25 @@ def _compute_parseval_errors(
 
     Inputs have shape (nframes, nq, nmodes) and (nframes,) respectively.
     Their physical units agree and depend on the supplied Cartesian vectors.
+    Non-finite inputs, norm sums or nonzero-frame relative errors raise
+    RuntimeError, even if the caller disables the completeness tolerance.
+    NaN is reserved for a finite zero atomic norm with zero modal norm.
     """
-    modal_norms = squared_moduli.sum(axis=(1, 2))
-    errors = np.full_like(atomic_norms, np.nan)
-    nonzero = atomic_norms != 0.0
-    errors[nonzero] = (
-        np.abs(modal_norms[nonzero] - atomic_norms[nonzero]) / atomic_norms[nonzero]
-    )
+    if not np.isfinite(squared_moduli).all() or not np.isfinite(atomic_norms).all():
+        raise RuntimeError(
+            "Non-finite projection results: squared moduli or atomic norms"
+        )
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        modal_norms = squared_moduli.sum(axis=(1, 2))
+        errors = np.full_like(atomic_norms, np.nan)
+        nonzero = atomic_norms != 0.0
+        errors[nonzero] = (
+            np.abs(modal_norms[nonzero] - atomic_norms[nonzero]) / atomic_norms[nonzero]
+        )
+    if not np.isfinite(modal_norms).all() or not np.isfinite(errors[nonzero]).all():
+        raise RuntimeError("Non-finite Parseval norms or relative errors")
+    if np.any(modal_norms[~nonzero] != 0.0):
+        raise RuntimeError("Nonzero modal norm for a zero atomic norm")
     return errors
 
 
@@ -173,6 +230,15 @@ def _project_vectors(
             )
     if len(trajectory) == 0:
         raise ValueError("No trajectory frames were read")
+    reference_cell = np.asarray(reference_atoms.cell, dtype=np.float64)
+    if (
+        reference_cell.shape != (3, 3)
+        or not np.isfinite(reference_cell).all()
+        or abs(np.linalg.det(reference_cell)) < 1e-12
+    ):
+        raise ValueError(
+            "Reference cell must be finite and nonsingular with shape (3, 3)"
+        )
 
     if reference_atoms.masses is not None:
         masses = reference_atoms.masses
@@ -281,10 +347,12 @@ def _project_vectors(
             return_complex,
         )
         if return_complex:
+            if not np.isfinite(modal_values).all():
+                raise RuntimeError("Non-finite complex projection results")
             complex_batches.append(modal_values)
         errors = _compute_parseval_errors(squared_moduli, atomic_norms)
-        finite_errors = errors[np.isfinite(errors)]
-        max_error = float(finite_errors.max()) if finite_errors.size else float("nan")
+        nonzero_errors = errors[atomic_norms != 0.0]
+        max_error = float(nonzero_errors.max()) if nonzero_errors.size else float("nan")
         logger.debug(f"Batch {ibatch}: max Parseval error = {max_error}")
         if parseval_tolerance is not None and max_error > parseval_tolerance:
             raise RuntimeError(

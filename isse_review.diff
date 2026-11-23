@@ -1,0 +1,2520 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index f7612f4..3ee6631 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -33,13 +33,15 @@ src/isse/
+ ├── constants.py              # costanti fisiche, conversioni unità, masse atomiche
+ ├── structures.py             # Atoms e Trajectory lazy anche multi-file
+ ├── phonon_temperatures.py    # entry point alto livello per temperature modali
+-├── project_velocities.py     # proiezione velocità su modi fononici
++├── project_velocities.py     # validazione/batching velocità e workflow pubblico
++├── project_displacements.py  # proiezione spostamenti dalla reference su coordinate normali
+ ├── convert_file.py           # CLI/converter ASE con test di equivalenza
+ ├── convert.py                # converter ISSE-native senza ASE, non tracciato
+ ├── radial_distribution.py    # RDF totale su Trajectory lazy
+ ├── spectral.py               # VACF e VDOS/spettri vibrazionali
+ ├── helpers/
+ │   ├── cell_mapping.py       # mapping atomi supercella -> cella primitiva + basis
++│   ├── mode_projection.py    # motore condiviso interno, kernel Numba obbligatorio
+ │   ├── periodic.py           # wrap/unwrap e minimum-image in PBC
+ │   └── symmetry.py           # scaled positions, primitive cell via spglib, qpoint helpers
+ └── io/
+@@ -137,6 +139,16 @@ Output dict attuale:
+ 
+ Nota: `reconstructed_temperature` viene calcolata e loggata, ma non inserita in `results`; la docstring è stata aggiornata per riflettere l'output effettivo.
+ 
++### 5.4 Coordinate normali da spostamenti
++
++```text
++Trajectory (positions/unwrapped_positions) + reference Atoms + PhononModes/.evec
++    └─ project_displacements(..., position_mode=...)
++         ├─ _iter_displacement_batches: u = r - r_reference, con gestione immagini esplicita
++         └─ helpers.mode_projection._project_vectors: mapping, coefficienti, kernel Numba e Parseval condivisi
++              └─ qpoints, |Q|², sum(m|u|²), errori, opzionale Q complesso
++```
++
+ ## 6. Moduli e responsabilità
+ 
+ ### `constants.py`
+@@ -248,21 +260,57 @@ Responsabilità:
+ - Restituisce `(cell_indices, basis_indices), residuals`.
+ - Verifica residui e popolazioni per sito di basis.
+ 
++### `phonon_modes.py`
++
++API pubblica:
++- `PhononModes(primitive, qpoints, frequencies, eigenvectors)` con primitive `isse.structures.Atoms` (nessuna dipendenza ASE o extra), q ridotti `(nq, 3)`, frequenze cm⁻¹ `(nq, nmodes)`, autovettori complessi ortonormali `(nq, nmodes, nprim, 3)`.
++- `PhononModes.from_evec(filename, primitive=...)`: ordine primitive esplicito; converte autovalori signed omega² Ry in cm⁻¹.
++- `PhononModes.from_anphon(ph, qpoints, primitive=..., source_order_confirmed=True)`: API ALAMODE 2.0; nessun import obbligatorio di anphon.
++
++Contratti:
++- primitive nell'ordine, masse e immagini della sorgente, gauge Bloch con sole traslazioni di cella. L'API anphon non espone metadata primitive: la conferma dell'utente è obbligatoria, non si deduce l'ordine dalle shape.
++- Validazione shape, finitezza, masse esplicite positive e ortonormalità; nessuna rinormalizzazione silenziosa né inferenza delle masse dai simboli. Copia indipendente della primitive e degli array.
++- Documentazione/verifica sorgenti ufficiali: `docs/phonon_projection.md`; regressioni sintetiche: `tests/test_phonon_projection.py`.
++
++### `helpers/mode_projection.py`
++
++Responsabilità (API interna, non riesportata da `helpers/__init__.py`):
++- `_project_vectors(..., *, vector_batches, modes=None, return_complex=False)`: mapping, masse, coefficienti, orchestrazione batch e Parseval. L'iteratore di vettori cartesiani è obbligatorio; nessuna lettura implicita di velocità/spostamenti dalla trajectory.
++- `_precompute_coefficients(...)`, `_compute_parseval_errors(squared_moduli, atomic_norms)` e `_project_batch_numba(...)` condivisi dai workflow.
++- Nomi generici (`vectors`, `modal_values`, `squared_moduli`); unità determinate dai vettori forniti. Numba obbligatorio, nessun kernel NumPy o fallback, nessun parametro `backend`.
++- Test architetturali in `tests/test_mode_projection.py` e regressioni analitiche nei test dei workflow.
++
+ ### `project_velocities.py`
+ 
+ API principale:
+-- `project_velocities(trajectory, reference_atoms, evec_filepath, batch_size=100, parseval_tolerance=1e-6)`
++- `project_velocities(trajectory, reference_atoms, evec_filepath=None, batch_size=100, parseval_tolerance=1e-6, *, modes=None, return_complex=False)`
++- `evec_filepath` può anche essere un `PhononModes`; default conserva i quattro output storici, `return_complex=True` aggiunge qdot complesso come quinto output (sqrt(amu) Å/fs).
++- Kernel Numba obbligatorio a batch tramite `helpers/mode_projection.py`; coefficienti e convenzione di fase invariati. Input modes usa il mapping esplicito source-ordered con validazione specie/masse e supercella; il percorso file-only mantiene spglib per retrocompatibilità.
++- Basi parziali/Gamma-only richiedono `parseval_tolerance=None`; nessuna rinormalizzazione. Per basi complete si verificano anche ortogonalità/commensurabilità dei qpoints.
++- `calculate_temperature` accetta anch'esso `modes=`; nessun parametro `backend`.
+ 
+-Helper:
+-- `_compute_parseval_errors(qdot2, atomic_norms)`
+-- `_precompute_coefficients(qpoints, eigenvectors, cell_indices, basis_indices, masses)`
+-- `_iter_velocity_batches(trajectory, natoms, batch_size)`
+-- `_project_batch_numba(...)` (Numba obbligatorio)
++Helper locale:
++- `_iter_velocity_batches(trajectory, natoms, batch_size)`; l'orchestrazione è importata da `helpers.mode_projection`.
+ 
+ Contratti importanti:
+-- `reference_atoms.masses` deve essere presente.
++- Masse da `reference_atoms` o dal primo frame della trajectory; finite e positive. Con `PhononModes` devono coincidere con quelle della primitive.
+ - Ogni frame della trajectory deve contenere `velocities` shape `(natoms, 3)`.
+-- `parseval_tolerance` può essere `None` a runtime, anche se type hint attuale è `float`.
++- `parseval_tolerance: float | None`; `None` disabilita la validazione per proiezioni parziali.
++
++### `project_displacements.py`
++
++API pubblica:
++- `project_displacements(trajectory, reference_atoms, evec_filepath=None, batch_size=100, parseval_tolerance=1e-6, *, modes=None, return_complex=False, position_mode="minimum_image")`.
++- Stessi input fononici, mapping, coefficienti e kernel Numba di `project_velocities`, importati da `helpers.mode_projection`; nessuna dipendenza fra i due workflow, nessuna nuova dipendenza esterna.
++- Output `(qpoints, q2, atomic_norms, parseval_errors)`; `return_complex=True` aggiunge Q complesso `(nframes, nq, nmodes)` in sqrt(amu) Å. q2 e norme in amu Å², non energie.
++
++Contratti/assunzioni:
++- Reference di equilibrio fissa e frame nello stesso ordine/specie; celle uguali entro 1e-8 Å. Celle variabili rifiutate, nessuna sottrazione implicita di COM, rotazione o strain.
++- `minimum_image`: differenze posizioni rispetto alla reference con MIC nella supercella, non nella primitiva; escursioni < metà box in coordinate frazionarie. Limite MIC su celle fortemente skewed come helper esistente.
++- `unwrapped`: richiede `frame.unwrapped_positions`; sottrae reference.unwrapped_positions se presente, altrimenti reference.positions. Origini delle immagini devono essere coerenti, nessuna correzione automatica.
++- `cartesian`: differenza diretta di positions, senza MIC.
++- Basi parziali richiedono `parseval_tolerance=None`, senza rinormalizzazione. Qdot = dQ/dt solo a reference/basis fissa e immagini continue.
++- Test sintetici in `tests/test_displacement_projection.py`; doc in `docs/phonon_projection.md`.
+ 
+ ### `phonon_temperatures.py`
+ 
+@@ -377,7 +425,7 @@ Contratti/assunzioni:
+ Questa sezione va aggiornata man mano che il codice evolve.
+ 
+ 1. **TODO esistente** (`src/isse/TODO.md`):
+-   - in `calculate_temperature`, se `reference_atoms` non ha masse, oggi viene sollevata eccezione; desiderato: prenderle dalla trajectory.
++   - fallback masse dal primo frame implementato in `project_velocities` (usato anche da `calculate_temperature`).
+    - TODO dice anche che `calculate_temperature` dovrebbe restituire i qpoints, ma il codice attuale li include già in `results["qpoints"]`.
+ 2. **API package parzialmente esposta**: gli `__init__.py` espongono funzioni/workflow principali, parser/writer e helper stabili; `Atoms` e `Trajectory` restano importabili da `isse.structures` per uso avanzato/test.
+ 3. **Assenza test**: nessuna suite test versionata. Priorità alta per parser, unità, shape, lazy loading, Parseval.
+@@ -393,7 +441,7 @@ Questa sezione va aggiornata man mano che il codice evolve.
+    - typo in messaggi tipo `Succesfully`.
+    - in `phonon_temperatures.py` il messaggio `logger.info` sembra mancare una parentesi `)` nel testo formattato.
+ 10. **Type hints**:
+-   - `parseval_tolerance` documentato come opzionale/`None`, ma annotato `float`.
++   - `parseval_tolerance` ora annotato `float | None` in proiezione e temperature.
+    - alcuni return/import usano `np.ndarray` generico invece di `NDArray[...]`.
+ 
+ ## 8. Come estendere questa mappa
+diff --git a/README.md b/README.md
+index 811064f..d4e18a3 100644
+--- a/README.md
++++ b/README.md
+@@ -13,7 +13,7 @@ The project provides lightweight atomistic data structures, lazy trajectory I/O,
+ - Native readers and writers for selected VASP, LAMMPS, and GPUMD/extended-XYZ files.
+ - Explicit unit handling for LAMMPS `metal` and `real` unit styles.
+ - Dependency-light conversion utilities without ASE.
+-- Phonon modal temperature workflow using ALAMODE eigenvector files.
++- Phonon velocity/displacement projection and modal temperatures from legacy ALAMODE files, NumPy arrays, or the ALAMODE 2.0 Python API; optional complex modal velocities and normal coordinates.
+ - Radial distribution function calculation using Numba.
+ - Velocity autocorrelation and vibrational density of states utilities.
+ - Periodic-boundary utilities for wrapping, unwrapping, and minimum-image distances.
+@@ -40,7 +40,14 @@ Runtime dependencies are:
+ - `spglib`
+ - `numba`
+ 
+-Numba is required for the velocity projection, RDF, and Filon transform implementations; no NumPy fallback is provided.
++Numba is required at runtime for the projection, RDF, and Filon implementations.
++Normal-mode projection uses Numba exclusively; there is no NumPy fallback or
++backend-selection argument.
++
++Source-independent phonon data uses ISSE's own `Atoms` structure and needs no
++additional dependencies. ALAMODE is installed separately and is not required
++for legacy files or NumPy-array phonon inputs; ASE is not required for any
++phonon projection interface.
+ 
+ ## Internal unit convention
+ 
+@@ -293,9 +300,64 @@ Requirements for this workflow:
+ - The ALAMODE `.evec` file is read by `isse.io.parse_alamode.read_alamode_evec`.
+ - A Parseval consistency check is performed by default; pass `parseval_tolerance=None` to disable it.
+ 
++### Source-independent phonons and complex modal velocities
++
++Use `PhononModes` to supply arrays directly, read an `.evec` with an explicitly
++ordered primitive, or adapt `anphon.Phonon` without ISSE-generated intermediate
++files. Both `project_velocities` and `calculate_temperature` accept `modes=`.
++
++```python
++from isse import PhononModes, project_velocities
++
++# ph is anphon.Phonon("harmonic.h5"). primitive is an isse.structures.Atoms object
++# whose order, basis images and masses have been checked against ALAMODE.
++modes = PhononModes.from_anphon(
++    ph, [[0, 0, 0]], primitive=primitive, source_order_confirmed=True,
++)
++q, squared, norms, deficits, complex_velocity = project_velocities(
++    trajectory, reference, modes=modes,
++    return_complex=True, parseval_tolerance=None,
++)
++```
++
++Gamma-only projections in a multi-cell supercell are incomplete: disable
++Parseval validation explicitly; no partial-basis renormalization is applied.
++Complex velocities have units sqrt(amu) Å/fs; their squared moduli are not total
++harmonic energies. Eigenvector phases and degenerate-subspace rotations affect
++individual modal amplitudes.
++
++See [the projection guide](docs/phonon_projection.md) for complete examples,
++array shapes, normalization, phase/ordering conventions, source verification,
++partial-basis interpretation, and test instructions.
++
++### Displacement projection
++
++Project deviations from the same fixed equilibrium reference onto normal
++coordinates, using the same phonon data and shared Numba projection engine:
++
++```python
++from isse import project_displacements
++
++q, q2, norms, deficits, Q = project_displacements(
++    trajectory, reference, modes=modes,
++    return_complex=True, parseval_tolerance=None,  # Gamma-only / partial basis
++    position_mode="minimum_image",
++)
++```
++
++`Q` has units sqrt(amu) Å; `q2 = abs(Q)**2` is not an energy. Both have shape
++`(nframes, nq, nmodes)`. Velocities are not required. Default displacements
++are minimum-image differences from the reference, using the supercell.
++Use `position_mode="unwrapped"` for explicit, image-aligned unwrapped positions,
++or `"cartesian"` for direct differences without image correction. Variable
++cells are rejected; no COM translation, rotation or strain is removed.
++See the [projection guide](docs/phonon_projection.md#displacement-projection--complex-normal-coordinates)
++for image conventions, completeness checks and phase limitations.
++
+ ## Development notes
+ 
+-The public API is currently module-based; import from the specific modules shown above. The top-level `isse` package does not yet re-export a stable aggregate API.
++Public workflows, including `PhononModes`, `project_velocities`,
++`project_displacements`, and `calculate_temperature`, are also available from the top-level `isse` package.
+ 
+ Recommended checks while developing:
+ 
+diff --git a/docs/phonon_projection.md b/docs/phonon_projection.md
+new file mode 100644
+index 0000000..82f9985
+--- /dev/null
++++ b/docs/phonon_projection.md
+@@ -0,0 +1,307 @@
++# Normal-mode velocity projection
++
++`PhononModes` uses `isse.structures.Atoms` and requires no additional ISSE
++dependencies. Install ALAMODE 2.0 and its `anphon` Python package separately
++if using the ALAMODE adapter. Neither ASE nor ALAMODE is required for legacy
++files or directly supplied arrays. Numba is a required ISSE runtime dependency
++and the only projection contraction implementation; there is no NumPy fallback
++or backend-selection argument.
++
++## Data contract
++
++`isse.PhononModes(primitive, qpoints, frequencies, eigenvectors)` is independent
++of the phonon solver. Its fields are:
++
++| Field | Shape | Convention |
++|---|---|---|
++| `primitive` | ISSE `Atoms`, `nprim` atoms | Å, masses in amu; cell vectors by row |
++| `qpoints` | `(nq, 3)` | Reduced reciprocal coordinates; phase includes 2π |
++| `frequencies` | `(nq, nmodes)` | cm⁻¹; imaginary frequencies are negative |
++| `eigenvectors` | `(nq, nmodes, nprim, 3)` | Complex, dimensionless, mode-first |
++
++Eigenvectors are orthonormal eigenvectors of the **mass-weighted dynamical
++matrix**, not Cartesian displacement patterns already divided by sqrt(mass).
++At each q their flattened rows satisfy `e.conj() @ e.T = identity`. Validation
++uses absolute tolerance 1e-6; it never silently normalizes input. Fewer than
++`3*nprim` modes are allowed. Shapes, finiteness, positive masses, and a
++nonsingular primitive cell are checked. Constructor inputs are copied.
++The primitive must contain explicit `masses`; they are never silently inferred
++from element symbols. ISSE's POSCAR parser populates masses from its element
++table; replace them explicitly if ALAMODE uses different masses or isotopes.
++
++**Ordering and gauge matter.** `primitive` must use the phonon source's exact
++atom order, cell orientation, origin, and basis images. Do not sort atoms or
++wrap/reimage primitive sites independently of the eigenvectors. The convention
++is `u_li ~ e_i exp(+2πi q.R_l) / sqrt(m_i)`, where `R_l` is an integer primitive
++cell translation. Full-position (`R_l + tau_i`) gauge eigenvectors must be
++converted by their source adapter before construction. The projection engine
++uses
++
++```text
++qdot[q, mode] = sum_li sqrt(m_i) e[q, mode, i]* . v_li
++               * exp(-2πi q.R_l) / sqrt(Ncells)
++```
++
++The star is complex conjugation. No extra basis-position phase is inserted.
++The explicit-data path maps reference atoms to this supplied primitive,
++checks species, masses, integer supercell geometry, site populations and
++absence of duplicate sites modulo supercell translations. Trajectory atoms
++must remain in reference order, with velocities in Å/fs. The reference must
++be the equilibrium structure, not a thermally distorted MD frame.
++
++## Legacy `.evec` files
++
++Existing positional and keyword calls and the default four outputs are unchanged:
++
++```python
++from isse import project_velocities
++
++q, qdot2, atomic_norms, errors = project_velocities(
++    trajectory, reference, "modes.evec", batch_size=100,
++)
++```
++
++The file-only path retains the historical spglib-derived primitive ordering.
++**Legacy text files contain no primitive basis positions or per-site species**;
++ISSE cannot prove that spglib's ordering matches the file. Parseval alone also
++cannot detect all ordering errors. Prefer explicit source-ordered data when
++that information is available:
++
++```python
++from isse import PhononModes
++from isse.io import parse_poscar
++
++primitive = parse_poscar("source_ordered_primitive.POSCAR")  # verified against ALAMODE
++modes = PhononModes.from_evec("modes.evec", primitive=primitive)
++q, qdot2, norms, errors = project_velocities(trajectory, reference, modes=modes)
++```
++
++`from_evec` checks the lattice against the supplied primitive. Text eigenvalues
++are signed squared frequencies in Rydberg units: conversion is
++`sign(omega2) * sqrt(abs(omega2)) * 109737.3156816` cm⁻¹. Frequencies are metadata;
++they are not used to scale velocity projections. Truncated mode blocks now
++raise an error rather than leaving uninitialized eigenvectors.
++
++## ALAMODE 2.0 Python API / Gamma-only example
++
++```python
++import anphon
++from isse import PhononModes, project_velocities
++from isse.io import parse_gpumd_dump, parse_poscar
++
++ph = anphon.Phonon("harmonic.h5")
++primitive = parse_poscar("source_ordered_primitive.POSCAR")
++# IMPORTANT: verify primitive against harmonic.h5 /PrimitiveCell metadata:
++# lattice (check units), fractional coordinates including basis images,
++# atomic kinds/elements and their order. Set primitive masses to the masses
++# used by anphon, including any general={"MASS": ...} overrides/isotopes.
++# An arbitrary symmetry-equivalent POSCAR is not sufficient.
++modes = PhononModes.from_anphon(
++    ph, [[0.0, 0.0, 0.0]], primitive=primitive,
++    source_order_confirmed=True,
++)
++reference = parse_poscar("supercell.POSCAR")
++trajectory = parse_gpumd_dump("production.xyz")
++q, qdot2, norms, deficits, qdot = project_velocities(
++    trajectory, reference, modes=modes,
++    parseval_tolerance=None,  # Gamma is incomplete for a multi-cell supercell
++    return_complex=True,
++    batch_size=50,
++)
++```
++
++The adapter makes one call to `ph.frequencies(qpoints, eigenvectors=True)`.
++The public API does **not** provide primitive ordering/mass metadata; hence
++`primitive` and the explicit `source_order_confirmed=True` acknowledgement
++are required. ISSE does not infer order from a matching atom count. The caller
++must check the source metadata; this adapter does not automatically read the
++force-constant HDF5 file. The source primitive's masses and mapped MD masses
++must agree (relative tolerance 1e-6).
++
++There are no ISSE-generated intermediate legacy files. Note that the verified
++ALAMODE implementation itself runs its solver in a temporary directory and
++reads an `.evec.h5` internally. It is currently serial-only and does not apply
++LO–TO splitting exactly at Gamma, even when nonanalytic corrections are enabled.
++
++## Direct NumPy arrays
++
++```python
++import numpy as np
++from isse import PhononModes, project_velocities
++from isse.structures import Atoms
++
++primitive = Atoms(
++    symbols=["H"], cell=np.eye(3), positions=np.zeros((1, 3)), masses=np.ones(1),
++)
++modes = PhononModes(
++    primitive=primitive,
++    qpoints=np.array([[0., 0., 0.]]),
++    frequencies=np.zeros((1, 3)),
++    eigenvectors=np.eye(3, dtype=complex).reshape(1, 3, 1, 3),
++)
++reference = Atoms(
++    symbols=["H"], cell=np.eye(3), positions=np.zeros((1, 3)),
++    masses=np.ones(1), velocities=np.array([[1., 2., 3.]]),
++)
++q, squared, norms, errors, complex_velocity = project_velocities(
++    [reference], reference, modes=modes, return_complex=True,
++)
++# complex_velocity[0, 0] == [1, 2, 3]; squared[0, 0] == [1, 4, 9]
++# norms[0] == 14; errors[0] == 0
++```
++
++## Outputs, completeness and interpretation
++
++Default outputs remain `(qpoints, qdot2, atomic_norms, parseval_errors)`.
++`return_complex=True` appends `qdot`, preserving phase across all batches. Both modal arrays have shape `(nframes, nq, nmodes)`.
++
++- `qdot`: sqrt(amu) Å/fs, complex128.
++- `qdot2 = abs(qdot)**2`: amu Å²/fs², float64.
++- `atomic_norms = sum_atoms mass * abs(velocity)**2`: amu Å²/fs².
++- `parseval_errors`: dimensionless relative norm difference; NaN for a frame
++  with zero velocity norm. For a partial basis this measures the missing norm,
++  not an error in the contraction.
++
++A full basis requires all `3*nprim` modes at all `Ncells` orthogonal,
++commensurate q-points. The explicit-data path checks these conditions when
++Parseval validation is enabled (default tolerance 1e-6), then validates each
++frame. For partial q/mode selections, including Gamma-only in a supercell,
++**pass `parseval_tolerance=None`**. No rescaling recovers the missing norm.
++Noncommensurate projections can also be explicitly requested with validation
++disabled, but do not form a periodic-supercell normal-mode decomposition.
++
++Half the squared modal velocity, multiplied by `AMU_A2_FS2_TO_EV`, is a modal
++**kinetic** energy in eV. It is not the total harmonic energy: velocity
++projection alone does not compute normal coordinates or potential energies.
++Displacement projection, described below, returns normal coordinates but does
++not compute energies automatically. `calculate_temperature` also
++accepts `modes=` with the same Parseval controls. It converts
++mean squared velocities to kinetic-equivalent temperatures; a partial basis
++must not be interpreted as a reconstructed system temperature. Its thermal
++average assumes the first three modes at Gamma are acoustic, as in the legacy
++workflow; do not use that average for arbitrary mode-index subsets.
++
++The eigenvector's arbitrary global phase changes individual complex modal
++velocities. Fix the eigenbasis across frames/runs when analyzing coherence.
++Within a degenerate subspace even the individual eigenvectors are arbitrary
++up to unitary rotations. The summed `abs(qdot)**2` over that subspace is
++invariant; individual amplitudes/phases are not. Compare subspace-invariant
++quantities or explicitly align bases before comparing independent solvers.
++Trajectory sampling, not the MD integration step, sets the projection time axis.
++
++## Displacement projection / complex normal coordinates
++
++`project_displacements` and `project_velocities` share mapping, coefficients,
++the batched Numba kernel and Parseval controls in `helpers/mode_projection.py`.
++Each public workflow supplies its own vector-batch iterator; neither calls the
++other, and the shared engine never selects a physical input field. It accepts the same legacy
++`.evec` file or `PhononModes` inputs (including `from_anphon` and direct arrays),
++uses only ISSE structures, and does **not** require frame velocities.
++
++With an equilibrium supercell `reference` and the source-ordered `modes` above:
++
++```python
++from isse import project_displacements
++
++q, q2, displacement_norms, deficits, Q = project_displacements(
++    trajectory, reference, modes=modes,
++    return_complex=True,
++    parseval_tolerance=None,  # for Gamma-only or other incomplete bases
++    position_mode="minimum_image",
++    batch_size=50,
++)
++# Q.shape == (nframes, nq, nmodes); q2 == abs(Q)**2
++```
++
++The normal coordinate is
++
++```text
++u_li(t) = r_li(t) - r_li(reference)  # with image handling chosen below
++Q[q, mode] = sum_li sqrt(m_i) e[q, mode, i]* . u_li
++            * exp(-2πi q.R_l) / sqrt(Ncells)
++```
++
++The default four outputs are `(qpoints, q2, atomic_norms, parseval_errors)`;
++`return_complex=True` appends `Q`, retaining the sign and complex phase rather
++than only a squared amplitude. Units:
++
++- `Q`: sqrt(amu) Å, complex128, shape `(nframes, nq, nmodes)`.
++- `q2 = abs(Q)**2`: amu Å², same shape, float64; **not an energy**.
++- `atomic_norms = sum_atoms mass * abs(displacement)**2`: amu Å²,
++  shape `(nframes,)`.
++- `parseval_errors`: dimensionless norm difference; NaN for zero displacement.
++
++Full-basis Parseval is `sum(abs(Q)**2) == sum(mass * abs(u)**2)`. Its validation
++is enabled by default; disable it explicitly for partial bases, without any
++renormalization. Source ordering, masses, phases, and degenerate-subspace
++limitations are identical to those for velocity projection.
++
++### Reference and periodic-image handling
++
++Use a **fixed equilibrium supercell**, not a thermally distorted initial frame
++unless that is deliberately the displacement origin. Frame atom order and
++symbols must match the reference. Every frame cell must equal the reference
++cell within an absolute tolerance of 1e-8 Å. Variable-cell trajectories raise
++an error: affine strain removal and a co-deforming basis are not silently
++assumed or implemented. No COM translation, rotation, or trajectory-average
++position is subtracted.
++
++Choose one explicit `position_mode`, consistently across all frames:
++
++- **`"minimum_image"` (default):** difference `frame.positions - reference.positions`,
++  minimum-imaged with the **supercell**, not the primitive cell. Handles wrapped
++  boundary crossings for small vibrational excursions. Assumes each atom stays
++  within half the supercell in fractional coordinates of its reference image.
++  There is no temporal unwrapping. The existing fractional-rounding MIC helper
++  is approximate for strongly skewed/non-reduced cells.
++- **`"unwrapped"`:** require `frame.unwrapped_positions` for every frame. Subtract
++  `reference.unwrapped_positions` if supplied, otherwise `reference.positions`.
++  No MIC is applied. The caller must align the trajectory's unwrapped origin
++  with the reference images; diffusion/large translations are retained.
++- **`"cartesian"`:** subtract `positions` directly, without MIC or unwrapping.
++  Use this only for already image-aligned Cartesian positions.
++
++For example, if the trajectory includes consistent unwrapped positions:
++
++```python
++q, q2, norms, errors, Q = project_displacements(
++    trajectory, reference, "modes.evec",  # or modes=modes
++    position_mode="unwrapped", return_complex=True,
++    parseval_tolerance=None,  # only if the supplied basis is incomplete
++)
++```
++
++With a fixed reference/basis and continuous, consistent images, `dQ/dt` is the
++complex modal velocity returned by `project_velocities` in the **same** basis.
++Minimum-image branch changes can make `Q` discontinuous and break that derivative
++relation. Consistent eigenvector phases and aligned degenerate bases are essential
++when comparing Q with qdot or comparing independent calculations. The sums of
++`abs(Q)**2` over degenerate subspaces are invariant under unitary basis rotations.
++
++## Verification and tests
++
++Conventions were checked against official ALAMODE documentation and source at
++commit [`57346cd6e00bd6277ef5a4a28f31e7c7fb2a932f`](https://github.com/ttadano/alamode/tree/57346cd6e00bd6277ef5a4a28f31e7c7fb2a932f):
++
++- `docs/source/anphon_python.rst`, `python/anphon/_api.py`: API, units,
++  mode-first layout, no public primitive accessor.
++- `anphon/system.cpp`, `docs/source/hdf5_format.rst`: PrimitiveCell coordinates,
++  kinds and ordering loaded from force-constant HDF5 metadata.
++- `anphon/dynamical.cpp` (`calc_analytic_k`): positive translation Bloch phase,
++  mass-divided force constants; normalized Hermitian eigenproblem.
++- `anphon/write_phonons.cpp`: legacy signed omega² and cell-translation phase
++  in generated mode patterns.
++
++Synthetic tests cover analytic complex Fourier projections using the required
++Numba kernel, full Parseval, Gamma/partial modes, explicit atomic order, malformed data and
++legacy equivalence. Displacement regressions also cover wrapped boundary
++crossings, explicit unwrapped origins, large excursions, triclinic cells,
++lazy batch invariance, zero displacement, fixed-cell/atom-order validation and
++an analytic coherent oscillation with matching modal velocities.
++The adapter contract is tested with a stub; no live
++ALAMODE installation, expensive phonon calculation or MD simulation is required.
++Run with ISSE's standard dependencies installed:
++
++```bash
++NUMBA_NUM_THREADS=2 python -m unittest discover -s tests -v
++```
+diff --git a/src/isse/__init__.py b/src/isse/__init__.py
+index b7c3e8a..cb48806 100644
+--- a/src/isse/__init__.py
++++ b/src/isse/__init__.py
+@@ -16,7 +16,9 @@ from .constants import (
+     symbol_from_mass,
+     symbols_from_masses,
+ )
++from .phonon_modes import PhononModes
+ from .phonon_temperatures import calculate_temperature
++from .project_displacements import project_displacements
+ from .project_velocities import project_velocities
+ from .radial_distribution import calculate_rdf
+ from .spectral import (
+@@ -34,14 +36,16 @@ __all__ = [
+     "KB_EV_K",
+     "KCAL_MOL_TO_EV",
+     "PS_TO_FS",
++    "PhononModes",
+     "calculate_rdf",
+     "calculate_temperature",
+     "calculate_vdos",
+     "mass_from_symbol",
+     "masses_from_symbols",
++    "project_displacements",
+     "project_velocities",
+     "symbol_from_mass",
++    "symbols_from_masses",
+     "velocity_autocorrelation",
+     "vibrational_density_of_states",
+-    "symbols_from_masses",
+ ]
+diff --git a/src/isse/constants.py b/src/isse/constants.py
+index 8e4f038..09df79f 100644
+--- a/src/isse/constants.py
++++ b/src/isse/constants.py
+@@ -4,13 +4,14 @@ from numpy import asarray
+ from numpy.typing import NDArray
+ 
+ # NIST CODATA: https://physics.nist.gov/cuu/Constants/index.html
+-ANGSTROM_TO_BOHR = 1.8897259886
+-BOHR_TO_ANGSTROM = 0.5291772106
+-AMU_A2_FS2_TO_EV = 103.64269653
+-HZ_TO_CM = 33.3564095198
+-KB_EV_K = 8.617333262e-5
+-KCAL_MOL_TO_EV = 0.0433641
+-PS_TO_FS = 1e3
++ANGSTROM_TO_BOHR: float = 1.8897259886
++BOHR_TO_ANGSTROM: float = 0.5291772106
++AMU_A2_FS2_TO_EV: float = 103.64269653
++HZ_TO_CM: float = 33.3564095198
++KB_EV_K: float = 8.617333262e-5
++KCAL_MOL_TO_EV: float = 0.0433641
++PS_TO_FS: float = 1e3
++RY_TO_CM: float = 109737.3156816
+ 
+ # Approximate standard atomic weights in unified atomic mass units (u).
+ # Values are intended for generic numerical use, not for isotope-resolved
+diff --git a/src/isse/helpers/mode_projection.py b/src/isse/helpers/mode_projection.py
+new file mode 100644
+index 0000000..10aaa13
+--- /dev/null
++++ b/src/isse/helpers/mode_projection.py
+@@ -0,0 +1,310 @@
++"""Internal mass-weighted normal-mode projection of Cartesian vector batches.
++
++Numba is required: there is no optional import or alternative contraction
++backend. Public velocity/displacement workflows supply their own vector batches.
++This module is intentionally not re-exported from ``isse.helpers``.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterator
++from logging import getLogger
++from pathlib import Path
++
++import numpy as np
++from numba import njit, prange
++from numpy.typing import NDArray
++
++from ..io.parse_alamode import read_alamode_evec
++from ..phonon_modes import PhononModes
++from ..structures import Atoms, Trajectory
++from .cell_mapping import map_atoms_to_primitive
++from .symmetry import get_scaled_positions
++
++logger = getLogger(__name__)
++
++
++def _compute_parseval_errors(
++    squared_moduli: NDArray[np.float64],
++    atomic_norms: NDArray[np.float64],
++) -> NDArray[np.float64]:
++    """Relative modal/Cartesian norm difference per frame; NaN for zero norm.
++
++    Inputs have shape (nframes, nq, nmodes) and (nframes,) respectively.
++    Their physical units agree and depend on the supplied Cartesian vectors.
++    """
++    modal_norms = squared_moduli.sum(axis=(1, 2))
++    errors = np.full_like(atomic_norms, np.nan)
++    nonzero = atomic_norms != 0.0
++    errors[nonzero] = (
++        np.abs(modal_norms[nonzero] - atomic_norms[nonzero]) / atomic_norms[nonzero]
++    )
++    return errors
++
++
++def _precompute_coefficients(
++    qpoints: NDArray[np.float64],
++    eigenvectors: NDArray[np.complex128],
++    cell_indices: NDArray[np.int32],
++    basis_indices: NDArray[np.int32],
++    masses: NDArray[np.float64],
++) -> NDArray[np.complex128]:
++    """Combine conjugated eigenvectors, translation phases and mass weights.
++
++    Reduced qpoints: (nq, 3); eigenvectors: (nq, nmodes, nbasis, 3);
++    cell_indices: (natoms, 3); basis_indices and masses: (natoms,).
++    Coefficients have shape (nq, nmodes, natoms, 3), with phase
++    exp(-2πi q.R_l) and normalization sqrt(mass / number_of_cells).
++    Contracting with velocities gives sqrt(amu) Å/fs; with displacements,
++    sqrt(amu) Å. No basis-position phase or partial-basis rescaling is added.
++    """
++    _, _, nbasis, ndim = eigenvectors.shape
++    natoms = len(masses)
++    if ndim != 3:
++        raise ValueError(f"Expected three Cartesian dimensions, found {ndim}.")
++    if natoms % nbasis != 0:
++        raise ValueError(f"{natoms} atoms are not divisible by {nbasis} basis atoms.")
++
++    ncells = natoms // nbasis
++    phases = np.exp(-2j * np.pi * (qpoints @ cell_indices.T))
++    eig_atoms = np.take(eigenvectors, basis_indices, axis=2)
++    coefficients = (
++        eig_atoms.conj()
++        * phases[:, None, :, None]
++        * np.sqrt(masses)[None, None, :, None]
++        / np.sqrt(ncells)
++    )
++    return np.ascontiguousarray(coefficients, dtype=np.complex128)
++
++
++@njit(cache=True, parallel=True)
++def _project_batch_numba(
++    vectors: NDArray[np.float64],
++    masses: NDArray[np.float64],
++    coefficients: NDArray[np.complex128],
++    return_complex: bool = False,
++):
++    """Contract (nframes, natoms, 3) Cartesian vectors, parallel over frames.
++
++    Returns squared moduli (nframes, nq, nmodes), mass-weighted Cartesian
++    norms (nframes,), and optionally complex modal values of the same modal
++    shape. Without complex output, an empty leading axis avoids allocating
++    that storage. Modal units are sqrt(amu) times the input vector units;
++    squared moduli and Cartesian norms have amu times squared input units.
++    """
++    nframes, natoms, _ = vectors.shape
++    nq, nmodes, _, _ = coefficients.shape
++    squared_moduli = np.empty((nframes, nq, nmodes), dtype=np.float64)
++    atomic_norms = np.empty(nframes, dtype=np.float64)
++    modal_values = np.empty(
++        (nframes if return_complex else 0, nq, nmodes), dtype=np.complex128
++    )
++
++    for iframe in prange(nframes):
++        atomic_norm = 0.0
++        for iatom in range(natoms):
++            x = vectors[iframe, iatom, 0]
++            y = vectors[iframe, iatom, 1]
++            z = vectors[iframe, iatom, 2]
++            atomic_norm += masses[iatom] * (x * x + y * y + z * z)
++        atomic_norms[iframe] = atomic_norm
++
++        for iq in range(nq):
++            for imode in range(nmodes):
++                modal_real = 0.0
++                modal_imag = 0.0
++                for iatom in range(natoms):
++                    x = vectors[iframe, iatom, 0]
++                    y = vectors[iframe, iatom, 1]
++                    z = vectors[iframe, iatom, 2]
++                    cx = coefficients[iq, imode, iatom, 0]
++                    cy = coefficients[iq, imode, iatom, 1]
++                    cz = coefficients[iq, imode, iatom, 2]
++                    modal_real += cx.real * x + cy.real * y + cz.real * z
++                    modal_imag += cx.imag * x + cy.imag * y + cz.imag * z
++                squared_moduli[iframe, iq, imode] = (
++                    modal_real * modal_real + modal_imag * modal_imag
++                )
++                if return_complex:
++                    modal_values[iframe, iq, imode] = modal_real + 1j * modal_imag
++
++    return squared_moduli, atomic_norms, modal_values
++
++
++def _project_vectors(
++    trajectory: Trajectory,
++    reference_atoms: Atoms,
++    evec_filepath: str | Path | PhononModes | None = None,
++    batch_size: int = 100,
++    parseval_tolerance: float | None = 1e-6,
++    *,
++    vector_batches: Iterator[NDArray[np.float64]],
++    modes: PhononModes | None = None,
++    return_complex: bool = False,
++) -> tuple:
++    """Map, prepare coefficients, and project caller-supplied vector batches.
++
++    The required iterator yields finite contiguous float64 arrays of shape
++    (batch_frames, natoms, 3) in reference order. Reading and validation of
++    physical vector data belong to the public workflow. The trajectory is
++    used only for length and, if needed, fallback masses from the first frame.
++    This engine never reads trajectory velocities, positions, or image fields;
++    reference positions are used only for the common atomic mapping.
++    """
++    if isinstance(evec_filepath, PhononModes):
++        if modes is not None:
++            raise ValueError("Supply phonon modes only once")
++        modes, evec_filepath = evec_filepath, None
++    if (modes is None) == (evec_filepath is None):
++        raise ValueError("Supply either evec_filepath or modes, not both")
++    if modes is not None and not isinstance(modes, PhononModes):
++        raise TypeError("modes must be PhononModes")
++    if parseval_tolerance is not None and (
++        not np.isfinite(parseval_tolerance) or parseval_tolerance < 0
++    ):
++        raise ValueError("parseval_tolerance must be finite and nonnegative or None")
++    if batch_size <= 0:
++        raise ValueError(f"batch_size must be positive, found {batch_size}.")
++    if evec_filepath is not None:
++        evec_filepath = Path(evec_filepath)
++        if not evec_filepath.is_file():
++            raise FileNotFoundError(
++                f"ALAMODE eigenvector file not found: {evec_filepath}"
++            )
++    if len(trajectory) == 0:
++        raise ValueError("No trajectory frames were read")
++
++    if reference_atoms.masses is not None:
++        masses = reference_atoms.masses
++    elif trajectory[0].masses is not None:
++        masses = trajectory[0].masses
++        logger.warning(
++            "No masses found in reference atoms. Using masses from trajectory."
++        )
++    else:
++        raise ValueError(
++            "The Trajectory or the reference Atoms object must contain atomic masses."
++        )
++    masses = np.asarray(masses, dtype=np.float64)
++    if (
++        masses.shape != (len(reference_atoms),)
++        or not np.isfinite(masses).all()
++        or np.any(masses <= 0)
++    ):
++        raise ValueError(
++            "Atomic masses must be finite, positive and match the reference"
++        )
++
++    if modes is None:
++        # Retain historical spglib mapping for callers supplying only a file.
++        _, qpoints, _, eigenvectors = read_alamode_evec(evec_filepath)
++        mapping_results, mapping_residuals = map_atoms_to_primitive(reference_atoms)
++    else:
++        primitive = modes.primitive
++        qpoints = modes.qpoints
++        eigenvectors = modes.eigenvectors
++        mapping_results, mapping_residuals = map_atoms_to_primitive(
++            reference_atoms,
++            primitive_cell=primitive.cell,
++            basis=get_scaled_positions(primitive),
++        )
++        transform = reference_atoms.cell @ np.linalg.inv(primitive.cell)
++        if not np.allclose(transform, np.rint(transform), atol=1e-6, rtol=0):
++            raise ValueError(
++                "Reference cell must be an integer supercell of the phonon primitive"
++            )
++        ncells = len(reference_atoms) // len(primitive)
++        if not np.isclose(abs(np.linalg.det(transform)), ncells, atol=1e-6, rtol=0):
++            raise ValueError(
++                "Reference cell volume is inconsistent with primitive populations"
++            )
++        # Positions separated by a supercell translation must not be duplicated.
++        translations, sites = mapping_results
++        super_scaled = translations @ np.linalg.inv(transform)
++        for site in range(len(primitive)):
++            points = super_scaled[sites == site]
++            for i in range(len(points)):
++                delta = points[i + 1 :] - points[i]
++                if np.any(
++                    np.all(np.isclose(delta, np.rint(delta), atol=1e-6, rtol=0), axis=1)
++                ):
++                    raise ValueError(
++                        "Duplicate primitive site modulo the reference supercell"
++                    )
++        basis_indices = mapping_results[1]
++        expected_symbols = np.asarray(primitive.symbols)[basis_indices]
++        if not np.array_equal(expected_symbols, reference_atoms.symbols):
++            raise ValueError(
++                "Mapped species do not match the phonon primitive ordering"
++            )
++        if not np.allclose(
++            masses, primitive.masses[basis_indices], atol=1e-6, rtol=1e-6
++        ):
++            raise ValueError("Mapped masses differ from the phonon primitive masses")
++        if parseval_tolerance is not None:
++            if eigenvectors.shape[1] != 3 * len(primitive) or len(qpoints) != ncells:
++                raise ValueError(
++                    "Incomplete basis: pass parseval_tolerance=None for partial projections"
++                )
++            phases = np.exp(
++                -2j * np.pi * (qpoints @ translations[basis_indices == 0].T)
++            )
++            if not np.allclose(
++                phases @ phases.conj().T / ncells, np.eye(ncells), atol=1e-6, rtol=0
++            ):
++                raise ValueError(
++                    "q-points are not an orthogonal complete supercell basis"
++                )
++            if not np.allclose(
++                qpoints @ transform.T, np.rint(qpoints @ transform.T), atol=1e-6, rtol=0
++            ):
++                raise ValueError(
++                    "q-points are not commensurate with the reference supercell"
++                )
++    cell_indices, basis_indices = mapping_results
++    logger.info(
++        f"Successfully mapped atoms to primitive cell with {np.max(mapping_residuals):.2e} A max residual."
++    )
++    coefficients = _precompute_coefficients(
++        qpoints, eigenvectors, cell_indices, basis_indices, masses
++    )
++
++    complex_batches: list[NDArray[np.complex128]] = []
++    squared_modulus_batches: list[NDArray[np.float64]] = []
++    atomic_norm_batches: list[NDArray[np.float64]] = []
++    parseval_error_batches: list[NDArray[np.float64]] = []
++    for ibatch, vectors in enumerate(vector_batches):
++        squared_moduli, atomic_norms, modal_values = _project_batch_numba(
++            vectors,
++            masses,
++            coefficients,
++            return_complex,
++        )
++        if return_complex:
++            complex_batches.append(modal_values)
++        errors = _compute_parseval_errors(squared_moduli, atomic_norms)
++        finite_errors = errors[np.isfinite(errors)]
++        max_error = float(finite_errors.max()) if finite_errors.size else float("nan")
++        logger.debug(f"Batch {ibatch}: max Parseval error = {max_error}")
++        if parseval_tolerance is not None and max_error > parseval_tolerance:
++            raise RuntimeError(
++                "Parseval error exceeds tolerance: "
++                f"max={max_error:.6e} > {parseval_tolerance:.6e}."
++            )
++        squared_modulus_batches.append(squared_moduli)
++        atomic_norm_batches.append(atomic_norms)
++        parseval_error_batches.append(errors)
++    if not squared_modulus_batches:
++        raise ValueError(
++            "No trajectory frames were read. "
++            "The trajectory is empty or the parser did not yield any frames."
++        )
++    result = (
++        qpoints,
++        np.concatenate(squared_modulus_batches, axis=0),
++        np.concatenate(atomic_norm_batches, axis=0),
++        np.concatenate(parseval_error_batches, axis=0),
++    )
++    if return_complex:
++        return (*result, np.concatenate(complex_batches, axis=0))
++    return result
+diff --git a/src/isse/io/parse_alamode.py b/src/isse/io/parse_alamode.py
+index 7993781..ce167a5 100644
+--- a/src/isse/io/parse_alamode.py
++++ b/src/isse/io/parse_alamode.py
+@@ -87,6 +87,8 @@ def read_alamode_evec(
+     while i < len(lines):
+         k_match = kpoint_re.match(lines[i])
+         if k_match:
++            if iq >= 0 and imode != nmodes:
++                raise ValueError("Incomplete mode block in ALAMODE file.")
+             iq += 1
+             imode = 0
+             if iq >= nq:
+@@ -112,6 +114,8 @@ def read_alamode_evec(
+ 
+         i += 1
+ 
++    if imode != nmodes:
++        raise ValueError("Incomplete mode block in ALAMODE file.")
+     if iq + 1 != nq:
+         raise ValueError(f"Read {iq + 1} q-points; expected {nq}.")
+ 
+diff --git a/src/isse/phonon_modes.py b/src/isse/phonon_modes.py
+new file mode 100644
+index 0000000..3b4530d
+--- /dev/null
++++ b/src/isse/phonon_modes.py
+@@ -0,0 +1,130 @@
++"""
++Source-independent, mass-weighted phonon eigenmodes.
++"""
++
++from __future__ import annotations
++
++from copy import deepcopy
++from dataclasses import dataclass
++
++import numpy as np
++from numpy.typing import NDArray
++
++from .io.parse_alamode import read_alamode_evec
++from .structures import Atoms
++from .constants import RY_TO_CM
++
++
++@dataclass(slots=True)
++class PhononModes:
++    """Phonons in an explicitly ordered primitive basis.
++
++    ``primitive`` is ISSE Atoms (Å, amu), in exactly the source's atom order
++    and cell-origin/image convention. qpoints: (nq, 3), reduced reciprocal;
++    frequencies: (nq, nmodes), cm^-1 (negative for imaginary modes);
++    eigenvectors: (nq, nmodes, natoms, 3), dimensionless orthonormal rows of
++    the mass-weighted dynamical matrix. Partial mode sets are allowed.
++
++    The Bloch convention is ``u_li ~ e_i exp(+2πi q.R_l) / sqrt(m_i)``:
++    eigenvectors must use the cell-translation gauge, not the full-position
++    gauge. No normalization, mass weighting or phase correction is applied.
++    """
++
++    primitive: Atoms
++    qpoints: NDArray[np.float64]
++    frequencies: NDArray[np.float64]
++    eigenvectors: NDArray[np.complex128]
++
++    def __post_init__(self):
++        if not isinstance(self.primitive, Atoms):
++            raise TypeError("primitive must be an isse.structures.Atoms object")
++        self.primitive = deepcopy(self.primitive)
++        self.qpoints = np.array(self.qpoints, dtype=np.float64, copy=True)
++        self.frequencies = np.array(self.frequencies, dtype=np.float64, copy=True)
++        self.eigenvectors = np.array(self.eigenvectors, dtype=np.complex128, copy=True)
++        n = len(self.primitive)
++        if (
++            n == 0
++            or not np.isfinite(self.primitive.cell).all()
++            or abs(np.linalg.det(self.primitive.cell)) < 1e-12
++        ):
++            raise ValueError("primitive must have a finite, nonsingular 3D cell")
++        if not np.isfinite(self.primitive.positions).all():
++            raise ValueError("primitive positions must be finite")
++        masses = self.primitive.masses
++        if masses is None:
++            raise ValueError("primitive must contain explicit atomic masses in amu")
++        if masses.shape != (n,) or not np.isfinite(masses).all() or np.any(masses <= 0):
++            raise ValueError(
++                "primitive masses must have shape (natoms,) and be finite and positive"
++            )
++        if (
++            self.qpoints.ndim != 2
++            or self.qpoints.shape[1] != 3
++            or len(self.qpoints) == 0
++        ):
++            raise ValueError("qpoints must have shape (nq, 3), nq > 0")
++        if self.frequencies.ndim != 2 or self.frequencies.shape[0] != len(self.qpoints):
++            raise ValueError("frequencies must have shape (nq, nmodes)")
++        nmodes = self.frequencies.shape[1]
++        if not 0 < nmodes <= 3 * n:
++            raise ValueError("nmodes must lie between 1 and 3 * natoms")
++        if self.eigenvectors.shape != (len(self.qpoints), nmodes, n, 3):
++            raise ValueError("eigenvectors must have shape (nq, nmodes, natoms, 3)")
++        if not all(
++            np.isfinite(a).all()
++            for a in (self.qpoints, self.frequencies, self.eigenvectors)
++        ):
++            raise ValueError("phonon arrays must be finite")
++        flat = self.eigenvectors.reshape(len(self.qpoints), nmodes, 3 * n)
++        if not np.allclose(
++            flat.conj() @ flat.swapaxes(1, 2), np.eye(nmodes), atol=1e-6, rtol=0
++        ):
++            raise ValueError(
++                "eigenvectors must be orthonormal mass-weighted dynamical-matrix eigenvectors"
++            )
++
++    @classmethod
++    def from_evec(cls, filename, *, primitive):
++        """Read legacy text data with an explicit source-ordered ISSE primitive.
++
++        Legacy files do not store basis positions or per-site species; these
++        must be supplied, not inferred from eigenvector dimensions.
++        """
++        cell, qpoints, omega2, eigenvectors = read_alamode_evec(filename)
++        if not np.allclose(cell, primitive.cell, atol=1e-6, rtol=1e-6):
++            raise ValueError("primitive cell differs from the .evec lattice")
++        # ALAMODE text writes signed squared frequencies in Rydberg units.
++        frequencies = np.sign(omega2) * np.sqrt(np.abs(omega2)) * RY_TO_CM
++        return cls(primitive, qpoints, frequencies, eigenvectors)
++
++    @classmethod
++    def from_anphon(cls, phonon, qpoints, *, primitive, source_order_confirmed=False):
++        """Call ``anphon.Phonon.frequencies`` without importing anphon.
++
++        The public API returns no primitive structure/ordering metadata.
++        Supply the exact primitive used by ALAMODE, including masses (and
++        any MASS overrides), unwrapped basis images and order. Set
++        ``source_order_confirmed=True`` only after checking this against the
++        force-constant file's PrimitiveCell metadata. A POSCAR with merely
++        the same composition is NOT sufficient. No ordering is inferred.
++        """
++        if not source_order_confirmed:
++            raise ValueError(
++                "Confirm the primitive order, images, cell and masses against the ALAMODE source metadata"
++            )
++        qpoints = np.asarray(qpoints, dtype=np.float64)
++        if qpoints.shape == (3,):
++            qpoints = qpoints[None, :]
++        if qpoints.ndim != 2 or qpoints.shape[1] != 3 or len(qpoints) == 0:
++            raise ValueError("qpoints must have shape (nq, 3)")
++        frequencies, vectors = phonon.frequencies(qpoints, eigenvectors=True)
++        vectors = np.asarray(vectors)
++        n = len(primitive)
++        if vectors.shape != (len(qpoints), 3 * n, 3 * n):
++            raise ValueError(
++                "anphon eigenvectors must have shape (nq, 3*natoms, 3*natoms), mode axis first"
++            )
++        return cls(
++            primitive, qpoints, frequencies, vectors.reshape(len(qpoints), 3 * n, n, 3)
++        )
+diff --git a/src/isse/phonon_temperatures.py b/src/isse/phonon_temperatures.py
+index 66d4fce..d085d69 100644
+--- a/src/isse/phonon_temperatures.py
++++ b/src/isse/phonon_temperatures.py
+@@ -7,6 +7,7 @@ import numpy as np
+ from numpy.typing import NDArray
+ 
+ from .constants import AMU_A2_FS2_TO_EV, KB_EV_K
++from .phonon_modes import PhononModes
+ from .project_velocities import project_velocities
+ from .structures import Atoms, Trajectory
+ 
+@@ -16,10 +17,12 @@ logger = getLogger(__name__)
+ def calculate_temperature(
+     trajectory: Trajectory,
+     reference_atoms: Atoms,
+-    evec_filepath: str | Path,
++    evec_filepath: str | Path | PhononModes | None = None,
+     selected_iqs: NDArray[np.int32] | None = None,
+     batch_size: int = 100,
+-    parseval_tolerance: float = 1e-6,
++    parseval_tolerance: float | None = 1e-6,
++    *,
++    modes: PhononModes | None = None,
+ ) -> dict[str, NDArray[np.float64] | float]:
+     """
+     Project a trajectory onto phonon modes and compute modal temperatures.
+@@ -34,8 +37,12 @@ def calculate_temperature(
+     reference_atoms : Atoms
+         Reference structure corresponding to the supercell used for the
+         molecular dynamics simulation.
+-    evec_filepath : str or pathlib.Path
+-        Path to the ALAMODE eigenvector file.
++    evec_filepath : str, pathlib.Path or PhononModes, optional
++        Legacy file or source-independent phonons.
++    modes : PhononModes, optional
++        Explicit ordered phonon data, instead of evec_filepath. Partial
++        projections require parseval_tolerance=None; their temperatures are
++        kinetic-equivalent quantities, not a reconstructed system temperature.
+     selected_iqs : numpy.ndarray, optional
+         Indices of q-points for which the instantaneous modal temperature
+         time series is also returned. The default is ``None`` (skipped).
+@@ -71,6 +78,7 @@ def calculate_temperature(
+         evec_filepath,
+         batch_size=batch_size,
+         parseval_tolerance=parseval_tolerance,
++        modes=modes,
+     )
+ 
+     natoms = len(reference_atoms)
+@@ -78,10 +86,16 @@ def calculate_temperature(
+     mean_qdot2 = qdot2.mean(axis=0)
+     mode_temperatures = mean_qdot2 * AMU_A2_FS2_TO_EV / KB_EV_K
+ 
+-    gamma_index = 0
+     thermal_mask = np.ones_like(mode_temperatures, dtype=bool)
+-    thermal_mask[gamma_index, :3] = False
+-    mean_mode_temperature = float(mode_temperatures[thermal_mask].mean())
++    gamma = np.all(np.isclose(qpoints, np.rint(qpoints), atol=1e-8), axis=1)
++    # As in the legacy workflow, the first three Gamma modes are assumed
++    # acoustic. Arbitrarily selected mode subsets cannot use this average.
++    thermal_mask[gamma, :3] = False
++    mean_mode_temperature = (
++        float(mode_temperatures[thermal_mask].mean())
++        if thermal_mask.any()
++        else float("nan")
++    )
+ 
+     ndof = 3 * natoms - 3
+     reconstructed_temperature = float(
+@@ -92,9 +106,14 @@ def calculate_temperature(
+ 
+     relative_temperature_difference = (
+         abs(mean_mode_temperature - reconstructed_temperature) / mean_mode_temperature
++        if mean_mode_temperature > 0
++        else float("nan")
+     )
+ 
+-    if relative_temperature_difference > temperature_rtol:
++    if (
++        parseval_tolerance is not None
++        and relative_temperature_difference > temperature_rtol
++    ):
+         logger.warning(
+             "Potential residual drift present in the trajectory. "
+             "Mean thermal mode temperature and reconstructed temperature differ "
+@@ -119,7 +138,15 @@ def calculate_temperature(
+                 qdot2[:, selected_iqs, :] * AMU_A2_FS2_TO_EV / KB_EV_K
+             )
+ 
++    label = (
++        "Reconstructed temperature"
++        if parseval_tolerance is not None
++        else "Projected kinetic-equivalent temperature contribution (not a system temperature)"
++    )
++    finite_errors = parseval_errors[np.isfinite(parseval_errors)]
++    max_error = float(finite_errors.max()) if finite_errors.size else float("nan")
+     logger.info(
+-        f"Reconstructed temperature: {reconstructed_temperature:.2f} K (mean thermal mode: {mean_mode_temperature:.2f} K, max Parseval error: {np.nanmax(parseval_errors):.3e}"
++        f"{label}: {reconstructed_temperature:.2f} K (mean thermal mode: "
++        f"{mean_mode_temperature:.2f} K, max Parseval error: {max_error:.3e})"
+     )
+     return results
+diff --git a/src/isse/project_displacements.py b/src/isse/project_displacements.py
+new file mode 100644
+index 0000000..4322555
+--- /dev/null
++++ b/src/isse/project_displacements.py
+@@ -0,0 +1,189 @@
++"""Projection of reference-relative displacements onto phonon normal modes."""
++
++from __future__ import annotations
++
++from collections.abc import Iterator
++from pathlib import Path
++from typing import Literal
++
++import numpy as np
++from numpy.typing import NDArray
++
++from .helpers.mode_projection import _project_vectors
++from .helpers.periodic import minimum_image_displacements
++from .phonon_modes import PhononModes
++from .structures import Atoms, Trajectory
++
++PositionMode = Literal["minimum_image", "unwrapped", "cartesian"]
++
++
++def _iter_displacement_batches(
++    trajectory: Trajectory,
++    reference_atoms: Atoms,
++    batch_size: int,
++    position_mode: PositionMode,
++) -> Iterator[NDArray[np.float64]]:
++    """Yield finite displacements in reference order without loading all frames."""
++    natoms = len(reference_atoms)
++    reference_cell = np.asarray(reference_atoms.cell, dtype=np.float64)
++    reference_positions = reference_atoms.positions
++    if position_mode == "unwrapped" and reference_atoms.unwrapped_positions is not None:
++        reference_positions = reference_atoms.unwrapped_positions
++    reference_positions = np.asarray(reference_positions, dtype=np.float64)
++    if (
++        reference_positions.shape != (natoms, 3)
++        or not np.isfinite(reference_positions).all()
++    ):
++        raise ValueError("Reference positions must be finite with shape (natoms, 3)")
++
++    batch: list[NDArray[np.float64]] = []
++    for iframe, atoms in enumerate(trajectory):
++        if atoms.symbols != reference_atoms.symbols:
++            raise ValueError(
++                f"Trajectory frame {iframe} symbols must match reference atom order"
++            )
++        cell = np.asarray(atoms.cell, dtype=np.float64)
++        if cell.shape != (3, 3) or not np.allclose(
++            cell, reference_cell, atol=1e-8, rtol=0
++        ):
++            raise ValueError(
++                f"Trajectory frame {iframe} cell differs from the fixed reference cell"
++            )
++        positions = (
++            atoms.unwrapped_positions
++            if position_mode == "unwrapped"
++            else atoms.positions
++        )
++        if positions is None:
++            raise ValueError(
++                f"Trajectory frame {iframe} does not contain unwrapped_positions"
++            )
++        positions = np.asarray(positions, dtype=np.float64)
++        if positions.shape != (natoms, 3) or not np.isfinite(positions).all():
++            raise ValueError(
++                f"Trajectory frame {iframe} positions must be finite with shape ({natoms}, 3)"
++            )
++        displacements = positions - reference_positions
++        if position_mode == "minimum_image":
++            displacements = minimum_image_displacements(displacements, reference_cell)
++        batch.append(displacements)
++        if len(batch) == batch_size:
++            yield np.ascontiguousarray(batch, dtype=np.float64)
++            batch.clear()
++    if batch:
++        yield np.ascontiguousarray(batch, dtype=np.float64)
++
++
++def project_displacements(
++    trajectory: Trajectory,
++    reference_atoms: Atoms,
++    evec_filepath: str | Path | PhononModes | None = None,
++    batch_size: int = 100,
++    parseval_tolerance: float | None = 1e-6,
++    *,
++    modes: PhononModes | None = None,
++    return_complex: bool = False,
++    position_mode: PositionMode = "minimum_image",
++) -> tuple:
++    r"""Project displacements from a fixed equilibrium reference onto phonons.
++
++    Uses the same source ordering, mass weighting and cell-translation Bloch
++    gauge as :func:`isse.project_velocities`, with the same required Numba
++    contraction kernel (no alternative backend):
++
++    ``Q[q, nu] = sum_li sqrt(m_i) e[q, nu, i]* . u_li
++                 exp(-2πi q.R_l) / sqrt(Ncells)``.
++
++    Parameters
++    ----------
++    trajectory : Trajectory or sequence of Atoms
++        Frames in reference atom order. Velocities are not required. Positions
++        are in Å; each frame's cell must equal the reference cell to 1e-8 Å.
++    reference_atoms : Atoms
++        Fixed equilibrium supercell used for both atomic mapping and the
++        displacement origin. Masses (amu) are taken from this structure, or
++        from the first trajectory frame if absent, as for velocity projection.
++    evec_filepath : str, pathlib.Path or PhononModes, optional
++        Legacy ALAMODE file or source-independent modes. The legacy file-only
++        interface retains the historical spglib ordering assumption.
++    batch_size : int, optional
++        Maximum frames in each batch (default 100).
++    parseval_tolerance : float or None, optional
++        Relative tolerance for sum(|Q|²) == sum(m_i |u_i|²), default 1e-6.
++        Pass None for partial q/mode sets, including Gamma-only supercell
++        projections. Partial projections are never renormalized.
++    modes : PhononModes, optional
++        Explicit source-ordered phonon data, instead of evec_filepath.
++    return_complex : bool, optional
++        Append complex normal coordinates Q as a fifth output (default False).
++        Enable this to retain the sign/phase of coherent displacements.
++    position_mode : {"minimum_image", "unwrapped", "cartesian"}, optional
++        How to form displacements, consistently for every frame:
++
++        - ``minimum_image`` (default): minimum-image difference of positions
++          from reference positions, using the reference supercell, not the
++          primitive cell. Assumes excursions smaller than half the supercell
++          in fractional coordinates. No temporal unwrapping is performed.
++          The existing fractional-rounding helper is approximate for strongly
++          skewed/non-reduced cells.
++        - ``unwrapped``: require frame.unwrapped_positions and subtract
++          reference.unwrapped_positions if available, otherwise reference.positions.
++          The caller must ensure consistent image origins; no wrapping or
++          independent initial-image correction is applied.
++        - ``cartesian``: subtract positions directly, without periodic image
++          correction; useful for already image-aligned Cartesian data.
++
++    Returns
++    -------
++    qpoints : numpy.ndarray
++        Reduced q-points, shape (nq, 3).
++    q2 : numpy.ndarray
++        |Q|², shape (nframes, nq, nmodes), in amu Å². This is not an energy.
++    atomic_norms : numpy.ndarray
++        sum(m_i |u_i|²), shape (nframes,), in amu Å².
++    parseval_errors : numpy.ndarray
++        Relative norm difference, shape (nframes,). NaN for zero displacement
++        norms; a completeness deficit rather than a validation error for
++        partial bases with validation disabled.
++    Q : numpy.ndarray, optional
++        Only with return_complex=True: complex128 normal coordinates, shape
++        (nframes, nq, nmodes), in sqrt(amu) Å.
++
++    Notes
++    -----
++    No center-of-mass translation, rotation, or strain is subtracted. A fixed
++    harmonic basis does not define a unique treatment of variable cells;
++    changing-cell trajectories must be transformed explicitly before use.
++    Individual Q phases depend on eigenvector gauge, and on arbitrary basis
++    rotations within degenerate subspaces, exactly as for modal velocities.
++    ``dQ/dt = qdot`` only for consistent continuous displacement images and
++    a fixed reference/basis; minimum-image branch jumps break that relation.
++    """
++    if position_mode not in ("minimum_image", "unwrapped", "cartesian"):
++        raise ValueError(
++            "position_mode must be 'minimum_image', 'unwrapped' or 'cartesian'"
++        )
++    cell = np.asarray(reference_atoms.cell, dtype=np.float64)
++    if (
++        cell.shape != (3, 3)
++        or not np.isfinite(cell).all()
++        or abs(np.linalg.det(cell)) < 1e-12
++    ):
++        raise ValueError(
++            "Reference cell must be finite and nonsingular with shape (3, 3)"
++        )
++    return _project_vectors(
++        trajectory,
++        reference_atoms,
++        evec_filepath,
++        batch_size,
++        parseval_tolerance,
++        modes=modes,
++        return_complex=return_complex,
++        vector_batches=_iter_displacement_batches(
++            trajectory,
++            reference_atoms,
++            batch_size,
++            position_mode,
++        ),
++    )
+diff --git a/src/isse/project_velocities.py b/src/isse/project_velocities.py
+index 32e9c62..f225e5f 100644
+--- a/src/isse/project_velocities.py
++++ b/src/isse/project_velocities.py
+@@ -1,397 +1,126 @@
++"""Prepare trajectory velocities for shared Numba normal-mode projection."""
++
+ from __future__ import annotations
+ 
+ from collections.abc import Iterator
+-from logging import getLogger
+ from pathlib import Path
+ 
+ import numpy as np
+ from numpy.typing import NDArray
+ 
+-from numba import njit, prange
+-
+-from .helpers.cell_mapping import map_atoms_to_primitive
+-from .io.parse_alamode import read_alamode_evec
++from .helpers.mode_projection import _project_vectors
++from .phonon_modes import PhononModes
+ from .structures import Atoms, Trajectory
+ 
+-logger = getLogger(__name__)
+-
+-
+-def _compute_parseval_errors(
+-    qdot2: NDArray[np.float64],
+-    atomic_norms: NDArray[np.float64],
+-) -> NDArray[np.float64]:
+-    """
+-    Compute the per-frame relative Parseval (completeness) error.
+-
+-    The modal decomposition is complete and correctly normalized if the sum
+-    of the squared modal amplitudes over all q-points and modes equals the
+-    mass-weighted Cartesian velocity norm, for every frame. This function
+-    quantifies the relative deviation from that identity and can be used to
+-    detect an incorrect mapping, normalization, or coefficient calculation.
+-
+-    Parameters
+-    ----------
+-    qdot2 : numpy.ndarray
+-        Squared moduli of the projected modal velocities, with shape
+-        ``(nframes, nqpoints, nmodes)``.
+-    atomic_norms : numpy.ndarray
+-        Mass-weighted Cartesian velocity norm for each frame, with shape
+-        ``(nframes,)``.
+-
+-    Returns
+-    -------
+-    numpy.ndarray
+-        Relative Parseval error for each frame, with shape ``(nframes,)``.
+-        Frames with zero atomic norm are assigned ``numpy.nan``.
+-    """
+-    modal_norms = qdot2.sum(axis=(1, 2))
+-    errors = np.full_like(atomic_norms, np.nan)
+-
+-    nonzero = atomic_norms != 0.0
+-    errors[nonzero] = (
+-        np.abs(modal_norms[nonzero] - atomic_norms[nonzero]) / atomic_norms[nonzero]
+-    )
+-    return errors
+-
+-
+-def _precompute_coefficients(
+-    qpoints: NDArray[np.float64],
+-    eigenvectors: NDArray[np.float64],
+-    cell_indices: NDArray[np.int32],
+-    basis_indices: NDArray[np.int32],
+-    masses: NDArray[np.float64],
+-) -> NDArray[np.complex128]:
+-    """
+-    Precompute the frame-independent coefficients for velocity projection.
+-
+-    The coefficients combine the complex-conjugated phonon eigenvectors,
+-    the phase factors associated with the primitive-cell translations,
+-    the atomic mass weights, and the normalization by the number of
+-    primitive cells.
+-
+-    The resulting array can be contracted with atomic velocities to obtain
+-    mode-projected velocities for one or more trajectory frames.
+-
+-    Parameters
+-    ----------
+-    qpoints : numpy.ndarray
+-        Reduced q-point coordinates with shape ``(nqpoints, 3)``.
+-    eigenvectors : numpy.ndarray
+-        Complex phonon eigenvectors with shape
+-        ``(nqpoints, nmodes, nbasis, 3)``.
+-    cell_indices : numpy.ndarray
+-        Integer primitive-cell translation indices for each atom, with shape
+-        ``(natoms, 3)``.
+-    basis_indices : numpy.ndarray
+-        Primitive-basis index associated with each atom, with shape
+-        ``(natoms,)``.
+-    masses : numpy.ndarray
+-        Atomic masses with shape ``(natoms,)``.
+-
+-    Returns
+-    -------
+-    numpy.ndarray
+-        Complex projection coefficients with shape
+-        ``(nqpoints, nmodes, natoms, 3)`` and dtype ``complex128``.
+-
+-    Raises
+-    ------
+-    ValueError
+-        If the eigenvectors do not contain three Cartesian components or if
+-        the total number of atoms is not divisible by the number of atoms in
+-        the primitive basis.
+-    """
+-
+-    _, _, nbasis, ndim = eigenvectors.shape
+-    natoms = len(masses)
+-
+-    if ndim != 3:
+-        raise ValueError(f"Expected three Cartesian dimensions, found {ndim}.")
+-    if natoms % nbasis != 0:
+-        raise ValueError(f"{natoms} atoms are not divisible by {nbasis} basis atoms.")
+-
+-    ncells = natoms // nbasis
+-    phases = np.exp(-2j * np.pi * (qpoints @ cell_indices.T))
+-    eig_atoms = np.take(eigenvectors, basis_indices, axis=2)
+-
+-    coefficients = (
+-        eig_atoms.conj()
+-        * phases[:, None, :, None]
+-        * np.sqrt(masses)[None, None, :, None]
+-        / np.sqrt(ncells)
+-    )
+-    return np.ascontiguousarray(coefficients, dtype=np.complex128)
+-
+ 
+ def _iter_velocity_batches(
+     trajectory: Trajectory,
+     natoms: int,
+     batch_size: int,
+ ) -> Iterator[NDArray[np.float64]]:
+-    """
+-    Yield batches of atomic velocities from a lazy trajectory.
+-
+-    Parameters
+-    ----------
+-    trajectory : Trajectory
+-        Lazy trajectory yielding one ``Atoms`` object per frame.
+-    natoms : int
+-        Expected number of atoms in each trajectory frame.
+-    batch_size : int
+-        Maximum number of frames included in each batch.
+-
+-    Yields
+-    ------
+-    numpy.ndarray
+-        Cartesian atomic velocities with shape
+-        ``(nframes_batch, natoms, 3)``. The final batch may contain fewer
+-        than ``batch_size`` frames.
+-
+-    Raises
+-    ------
+-    ValueError
+-        If a frame does not contain velocities or has an unexpected velocity
+-        array shape.
+-    """
++    """Yield finite float64 velocity batches, shape (batch_frames, natoms, 3)."""
+     batch: list[NDArray[np.float64]] = []
+-
+     for iframe, atoms in enumerate(trajectory):
+         velocities = atoms.velocities
+-
+         if velocities is None:
+             raise ValueError(f"Trajectory frame {iframe} does not contain velocities.")
+-
+         if velocities.shape != (natoms, 3):
+             raise ValueError(
+                 f"Expected velocities with shape ({natoms}, 3) in frame "
+                 f"{iframe}, found {velocities.shape}."
+             )
+-
++        if not np.isfinite(velocities).all():
++            raise ValueError(f"Non-finite velocities in trajectory frame {iframe}.")
+         batch.append(velocities)
+-
+         if len(batch) == batch_size:
+             yield np.ascontiguousarray(batch, dtype=np.float64)
+             batch.clear()
+-
+     if batch:
+         yield np.ascontiguousarray(batch, dtype=np.float64)
+ 
+ 
+-@njit(cache=True, parallel=True)
+-def _project_batch_numba(
+-    velocities: NDArray[np.float64],
+-    masses: NDArray[np.float64],
+-    coefficients: NDArray[np.complex128],
+-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+-    """
+-    Project atomic velocities onto phonon modes using Numba.
+-
+-    The projection is evaluated independently for each trajectory frame,
+-    q-point, and phonon mode. Frames are processed in parallel using
+-    ``numba.prange``.
+-
+-    For each mode, the function computes the squared modulus of the
+-    mass-weighted projected velocity. It also computes the mass-weighted
+-    Cartesian velocity norm of each frame, which can be used to verify the
+-    completeness and normalization of the modal decomposition.
+-
+-    Parameters
+-    ----------
+-    velocities : numpy.ndarray
+-        Cartesian atomic velocities with shape
+-        ``(nframes, natoms, 3)``.
+-    masses : numpy.ndarray
+-        Atomic masses with shape ``(natoms,)``.
+-    coefficients : numpy.ndarray
+-        Complex frame-independent projection coefficients with shape
+-        ``(nqpoints, nmodes, natoms, 3)``.
+-
+-    Returns
+-    -------
+-    qdot2 : numpy.ndarray
+-        Squared moduli of the projected modal velocities, with shape
+-        ``(nframes, nqpoints, nmodes)`` and dtype ``float64``.
+-    atomic_norms : numpy.ndarray
+-        Mass-weighted Cartesian velocity norm for each frame, with shape
+-        ``(nframes,)`` and dtype ``float64``.
+-    """
+-    nframes, natoms, _ = velocities.shape
+-    nq, nmodes, _, _ = coefficients.shape
+-
+-    qdot2 = np.empty((nframes, nq, nmodes), dtype=np.float64)
+-    atomic_norms = np.empty(nframes, dtype=np.float64)
+-
+-    for iframe in prange(nframes):
+-        atomic_norm = 0.0
+-
+-        for iatom in range(natoms):
+-            vx = velocities[iframe, iatom, 0]
+-            vy = velocities[iframe, iatom, 1]
+-            vz = velocities[iframe, iatom, 2]
+-            atomic_norm += masses[iatom] * (vx * vx + vy * vy + vz * vz)
+-
+-        atomic_norms[iframe] = atomic_norm
+-
+-        for iq in range(nq):
+-            for imode in range(nmodes):
+-                qreal = 0.0
+-                qimag = 0.0
+-
+-                for iatom in range(natoms):
+-                    vx = velocities[iframe, iatom, 0]
+-                    vy = velocities[iframe, iatom, 1]
+-                    vz = velocities[iframe, iatom, 2]
+-
+-                    cx = coefficients[iq, imode, iatom, 0]
+-                    cy = coefficients[iq, imode, iatom, 1]
+-                    cz = coefficients[iq, imode, iatom, 2]
+-
+-                    qreal += cx.real * vx + cy.real * vy + cz.real * vz
+-                    qimag += cx.imag * vx + cy.imag * vy + cz.imag * vz
+-
+-                qdot2[iframe, iq, imode] = qreal * qreal + qimag * qimag
+-
+-    return qdot2, atomic_norms
+-
+-
+ def project_velocities(
+     trajectory: Trajectory,
+     reference_atoms: Atoms,
+-    evec_filepath: str | Path,
++    evec_filepath: str | Path | PhononModes | None = None,
+     batch_size: int = 100,
+-    parseval_tolerance: float = 1e-6,
+-) -> tuple[
+-    NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
+-]:
+-    """
+-    Project trajectory velocities onto the phonon eigenmodes.
+-
+-    The reference structure is used to determine the atomic masses, map the
+-    atoms onto the primitive cell, and precompute all frame-independent
+-    projection coefficients. The trajectory is then processed lazily in
+-    batches of frames.
++    parseval_tolerance: float | None = 1e-6,
++    *,
++    modes: PhononModes | None = None,
++    return_complex: bool = False,
++) -> tuple:
++    """Project trajectory velocities onto phonon eigenmodes using Numba.
++
++    The reference is used for masses, primitive mapping and frame-independent
++    coefficients. Velocity validation/batching is done here; the shared engine
++    in helpers.mode_projection performs contraction and Parseval validation.
++    Numba is required and there is no alternative projection backend.
+ 
+     Parameters
+     ----------
+     trajectory : Trajectory
+-        Lazy trajectory yielding one ``Atoms`` object per frame.
++        Lazy trajectory yielding Atoms in reference order, with velocities
++        in Å/fs and shape (natoms, 3).
+     reference_atoms : Atoms
+-        Reference structure corresponding to the supercell used for the
+-        molecular dynamics simulation.
+-    evec_filepath : str or pathlib.Path
+-        Path to the ALAMODE eigenvector file.
++        Equilibrium supercell corresponding to the simulation. Masses in amu
++        must be present here or in the first trajectory frame.
++    evec_filepath : str, pathlib.Path or PhononModes, optional
++        Legacy ALAMODE eigenvector file or source-independent modes. File-only
++        calls retain historical spglib mapping and assume primitive ordering
++        matches the file. Use PhononModes.from_evec for explicit source order.
+     batch_size : int, optional
+-        Maximum number of trajectory frames processed in each batch.
+-        The default is ``100``.
+-    parseval_tolerance: float, optional
+-        Maximum error for the parseval relation between cartesian and
+-        projected velocities. Passing None skips the checks.
+-        The default is 1e-6
++        Maximum trajectory frames processed in each batch (default 100).
++    parseval_tolerance : float or None, optional
++        Maximum relative Parseval error (default 1e-6). Pass None for partial
++        q/mode sets, including Gamma-only projections in multi-cell supercells.
++    modes : PhononModes, optional
++        Source-independent phonons with an explicitly ordered ISSE primitive.
++        Supply either this or evec_filepath, not both.
++    return_complex : bool, optional
++        Append complex modal velocities as a fifth output (default False).
+ 
+     Returns
+     -------
+     qpoints : numpy.ndarray
+-        Reduced q-point coordinates, with shape ``(nqpoints, 3)``.
++        Reduced q-point coordinates, shape (nqpoints, 3).
+     qdot2 : numpy.ndarray
+-        Squared moduli of the projected modal velocities, with shape
+-        ``(nframes, nqpoints, nmodes)``.
++        Squared modal velocities, shape (nframes, nqpoints, nmodes), in
++        amu Å²/fs². These are not total harmonic energies: half their value
++        times AMU_A2_FS2_TO_EV is the modal kinetic energy in eV.
+     atomic_norms : numpy.ndarray
+-        Mass-weighted Cartesian velocity norm for each frame, with shape
+-        ``(nframes,)``.
++        Mass-weighted Cartesian velocity norms, shape (nframes,), in amu Å²/fs².
+     parseval_errors : numpy.ndarray
+-        Relative Parseval error for each frame, with shape ``(nframes,)``.
++        Relative norm differences, shape (nframes,); NaN for zero atomic norm.
++        With partial bases and validation disabled this is a completeness deficit.
++    qdot : numpy.ndarray, optional
++        With return_complex=True: complex128, shape (nframes, nqpoints, nmodes),
++        in sqrt(amu) Å/fs. Uses conjugated eigenvectors, exp(-2πi q.R_l), and
++        normalization 1/sqrt(number of primitive cells). No partial-basis
++        renormalization is performed. Individual phases depend on eigenvector
++        phase and arbitrary rotations within degenerate subspaces; compare
++        subspace-invariant squared norms when necessary.
+ 
+     Raises
+     ------
+     FileNotFoundError
+         If the ALAMODE eigenvector file does not exist.
+     ValueError
+-        If the reference structure does not contain atomic masses, if
+-        ``batch_size`` is not positive or if the trajectory contains no frames.
++        For missing/invalid masses, velocities, phonon input, nonpositive batch
++        size, or an empty trajectory.
++    RuntimeError
++        If the per-frame Parseval error exceeds the requested tolerance.
+     """
+-    evec_filepath = Path(evec_filepath)
+-
+-    if batch_size <= 0:
+-        raise ValueError(f"batch_size must be positive, found {batch_size}.")
+-
+-    if not evec_filepath.is_file():
+-        raise FileNotFoundError(f"ALAMODE eigenvector file not found: {evec_filepath}")
+-
+-    if reference_atoms.masses is not None:
+-        masses = reference_atoms.masses
+-    elif trajectory[0].masses is not None:
+-        logger.warning(
+-            "No masses found in reference atoms. Using masses from trajectory."
+-        )
+-    else:
+-        raise ValueError(
+-            "The Trajectory or the reference Atoms object must contain atomic masses."
+-        )
+-
+-    masses = np.asarray(masses, dtype=np.float64)
+-    (
+-        alamode_primitive_cell,
+-        alamode_qpoints,
+-        eigenvalues,
+-        eigenvectors,
+-    ) = read_alamode_evec(evec_filepath)
+-
+-    mapping_results, mapping_residuals = map_atoms_to_primitive(reference_atoms)
+-    cell_indices, basis_indices = mapping_results
+-
+-    logger.info(
+-        f"Successfully mapped atoms to primitive cell with {np.max(mapping_residuals):.2e} A max residual."
+-    )
+-
+-    coefficients = _precompute_coefficients(
+-        alamode_qpoints,
+-        eigenvectors,
+-        cell_indices,
+-        basis_indices,
+-        masses,
+-    )
+-
+-    qdot2_batches: list[NDArray[np.float64]] = []
+-    atomic_norm_batches: list[NDArray[np.float64]] = []
+-    parseval_error_batches: list[NDArray[np.float64]] = []
+-
+-    for ibatch, velocities in enumerate(
+-        _iter_velocity_batches(
++    return _project_vectors(
++        trajectory,
++        reference_atoms,
++        evec_filepath,
++        batch_size,
++        parseval_tolerance,
++        modes=modes,
++        return_complex=return_complex,
++        vector_batches=_iter_velocity_batches(
+             trajectory,
+             natoms=len(reference_atoms),
+             batch_size=batch_size,
+-        )
+-    ):
+-        qdot2_batch, atomic_norms_batch = _project_batch_numba(
+-            velocities,
+-            masses,
+-            coefficients,
+-        )
+-        errors_batch = _compute_parseval_errors(qdot2_batch, atomic_norms_batch)
+-        logger.debug(f"Batch {ibatch}: max Parseval error = {np.nanmax(errors_batch)}")
+-
+-        if (
+-            parseval_tolerance is not None
+-            and np.nanmax(errors_batch) > parseval_tolerance
+-        ):
+-            raise RuntimeError(
+-                "Parseval error exceeds tolerance: "
+-                f"max={np.nanmax(errors_batch):.6e} > {parseval_tolerance:.6e}."
+-            )
+-
+-        qdot2_batches.append(qdot2_batch)
+-        atomic_norm_batches.append(atomic_norms_batch)
+-        parseval_error_batches.append(errors_batch)
+-
+-    if not qdot2_batches:
+-        raise ValueError(
+-            "No trajectory frames were read. "
+-            "The trajectory is empty or the parser did not yield any frames."
+-        )
+-
+-    return (
+-        alamode_qpoints,
+-        np.concatenate(qdot2_batches, axis=0),
+-        np.concatenate(atomic_norm_batches, axis=0),
+-        np.concatenate(parseval_error_batches, axis=0),
++        ),
+     )
+diff --git a/tests/test_displacement_projection.py b/tests/test_displacement_projection.py
+new file mode 100644
+index 0000000..0e3acc4
+--- /dev/null
++++ b/tests/test_displacement_projection.py
+@@ -0,0 +1,291 @@
++"""Analytic normal-coordinate and periodic-image regression tests."""
++
++import tempfile
++import unittest
++from copy import deepcopy
++from pathlib import Path
++
++import numpy as np
++
++from isse import PhononModes, project_displacements, project_velocities
++from isse.constants import BOHR_TO_ANGSTROM
++from isse.structures import Atoms, Trajectory
++
++
++class DisplacementProjectionTests(unittest.TestCase):
++    def setUp(self):
++        primitive = Atoms(
++            symbols=["H"],
++            cell=np.eye(3),
++            positions=np.zeros((1, 3)),
++            masses=np.array([4.0]),
++        )
++        self.q = np.array([[i / 4, 0, 0] for i in range(4)])
++        self.e = np.broadcast_to(
++            1j * np.eye(3).reshape(1, 3, 1, 3), (4, 3, 1, 3)
++        ).copy()
++        self.modes = PhononModes(primitive, self.q, np.ones((4, 3)), self.e)
++        self.reference = Atoms(
++            symbols=["H"] * 4,
++            cell=np.diag([4.0, 1.0, 1.0]),
++            positions=np.array([[i, 0, 0] for i in range(4)], dtype=float),
++            masses=np.full(4, 4.0),
++        )
++        self.displacements = np.arange(-30, 30, dtype=float).reshape(5, 4, 3) / 1000
++        self.frames = self.make_frames(self.displacements)
++        self.expected = -1j * np.einsum(
++            "ql,tla->tqa",
++            np.exp(-2j * np.pi * self.q[:, :1] * np.arange(4)),
++            self.displacements,
++        )
++
++    def make_frames(self, displacements, wrapped=False):
++        frames = []
++        for u in displacements:
++            positions = self.reference.positions + u
++            if wrapped:
++                positions = (
++                    positions @ np.linalg.inv(self.reference.cell) % 1
++                ) @ self.reference.cell
++            frames.append(
++                Atoms(
++                    symbols=self.reference.symbols.copy(),
++                    cell=self.reference.cell.copy(),
++                    positions=positions,
++                    masses=self.reference.masses.copy(),
++                )
++            )
++        return frames
++
++    def project(self, **kwargs):
++        return project_displacements(
++            self.frames, self.reference, modes=self.modes, **kwargs
++        )
++
++    def test_analytic_complex_and_parseval(self):
++        result = self.project(return_complex=True, batch_size=2)
++        np.testing.assert_allclose(result[4], self.expected, atol=1e-15)
++        np.testing.assert_allclose(result[1], np.abs(result[4]) ** 2, atol=1e-16)
++        np.testing.assert_allclose(
++            result[2], 4 * (self.displacements**2).sum(axis=(1, 2)), atol=1e-16
++        )
++        np.testing.assert_allclose(result[3], 0, atol=1e-14)
++        self.assertEqual(len(self.project()), 4)
++
++    def test_wrapped_positions_crossing_boundaries(self):
++        frames = self.make_frames(self.displacements, wrapped=True)
++        original_positions = [f.positions.copy() for f in frames]
++        result = project_displacements(
++            frames, self.reference, self.modes, return_complex=True
++        )
++        np.testing.assert_allclose(result[4], self.expected, atol=1e-14)
++        for f, original in zip(frames, original_positions):
++            np.testing.assert_array_equal(f.positions, original)
++        # Direct Cartesian differences deliberately retain the image jumps.
++        direct = project_displacements(
++            frames,
++            self.reference,
++            self.modes,
++            return_complex=True,
++            position_mode="cartesian",
++        )
++        self.assertFalse(np.allclose(direct[4], self.expected))
++
++    def test_unwrapped_and_direct_modes(self):
++        for frame in self.frames:
++            frame.unwrapped_positions = frame.positions.copy()
++            frame.positions[:] = 0  # Explicit unwrapped mode must ignore positions.
++        result = self.project(position_mode="unwrapped", return_complex=True)
++        np.testing.assert_allclose(result[4], self.expected, atol=1e-15)
++        # A common image origin in reference and trajectory is subtracted,
++        # not silently reimaged per frame.
++        shift = np.array([4.0, -1.0, 2.0])
++        self.reference.unwrapped_positions = self.reference.positions + shift
++        for frame in self.frames:
++            frame.unwrapped_positions += shift
++        shifted = self.project(position_mode="unwrapped", return_complex=True)
++        np.testing.assert_allclose(shifted[4], self.expected, atol=1e-14)
++        direct = project_displacements(
++            self.make_frames(self.displacements),
++            self.reference,
++            self.modes,
++            position_mode="cartesian",
++            return_complex=True,
++        )
++        np.testing.assert_allclose(direct[4], self.expected, atol=1e-15)
++
++    def test_unwrapped_large_excursions_are_not_folded(self):
++        displacements = self.displacements + np.array([5.0, 2.0, -3.0])
++        frames = self.make_frames(displacements, wrapped=True)
++        for frame, u in zip(frames, displacements):
++            frame.unwrapped_positions = self.reference.positions + u
++        unwrapped = project_displacements(
++            frames,
++            self.reference,
++            self.modes,
++            position_mode="unwrapped",
++            return_complex=True,
++        )
++        mic = project_displacements(
++            frames, self.reference, self.modes, return_complex=True
++        )
++        self.assertFalse(np.allclose(mic[4], unwrapped[4]))
++        np.testing.assert_allclose(
++            unwrapped[2], 4 * (displacements**2).sum(axis=(1, 2))
++        )
++
++    def test_triclinic_minimum_image(self):
++        cell = np.array([[4.0, 0.0, 0.0], [0.2, 1.0, 0.0], [0.1, 0.1, 1.0]])
++        primitive = deepcopy(self.modes.primitive)
++        primitive.cell = cell / np.array([4.0, 1.0, 1.0])[:, None]
++        modes = PhononModes(primitive, self.q, np.ones((4, 3)), self.e)
++        ref = deepcopy(self.reference)
++        ref.cell = cell
++        ref.positions = np.array([[i / 4, 0, 0] for i in range(4)]) @ cell
++        frames = []
++        for u in self.displacements:
++            pos = ref.positions + u
++            wrapped = (pos @ np.linalg.inv(cell) % 1) @ cell
++            frames.append(Atoms(ref.symbols, cell, wrapped, masses=ref.masses))
++        result = project_displacements(frames, ref, modes, return_complex=True)
++        np.testing.assert_allclose(result[4], self.expected, atol=1e-14)
++
++    def test_partial_gamma(self):
++        modes = PhononModes(
++            self.modes.primitive, self.q[:1], np.ones((1, 3)), self.e[:1]
++        )
++        with self.assertRaisesRegex(ValueError, "Incomplete basis"):
++            project_displacements(self.frames, self.reference, modes)
++        result = project_displacements(
++            self.frames,
++            self.reference,
++            modes,
++            return_complex=True,
++            parseval_tolerance=None,
++        )
++        np.testing.assert_allclose(result[4], self.expected[:, :1], atol=1e-15)
++        self.assertTrue(np.all(result[1].sum(axis=(1, 2)) < result[2]))
++
++    def test_zero_displacement_and_no_drift_removal(self):
++        result = project_displacements(
++            [deepcopy(self.reference)], self.reference, self.modes, return_complex=True
++        )
++        np.testing.assert_array_equal(result[4], 0)
++        self.assertTrue(np.isnan(result[3][0]))
++        translation = np.full((1, 4, 3), 0.1)
++        result = project_displacements(
++            self.make_frames(translation),
++            self.reference,
++            self.modes,
++            return_complex=True,
++        )
++        # A rigid translation is a physical Gamma coordinate unless removed by caller.
++        np.testing.assert_allclose(result[4][0, 0], -0.4j)
++        np.testing.assert_allclose(result[4][0, 1:], 0, atol=1e-15)
++
++    def test_fixed_basis_derivative_matches_velocity_projection(self):
++        omega = 0.02  # fs^-1, only for this analytic synthetic test
++        times = np.arange(5) * 3.0
++        pattern = np.zeros((4, 3))
++        pattern[:, 0] = 0.1 * np.cos(2 * np.pi * np.arange(4) / 4)
++        displacements = np.cos(omega * times)[:, None, None] * pattern
++        velocities = -omega * np.sin(omega * times)[:, None, None] * pattern
++        frames = self.make_frames(displacements)
++        for frame, v in zip(frames, velocities):
++            frame.velocities = v
++        coordinates = project_displacements(
++            frames, self.reference, self.modes, return_complex=True
++        )[4]
++        qdot = project_velocities(
++            frames, self.reference, self.modes, return_complex=True
++        )[4]
++        modal_pattern = -1j * np.einsum(
++            "ql,la->qa",
++            np.exp(-2j * np.pi * self.q[:, :1] * np.arange(4)),
++            pattern,
++        )
++        np.testing.assert_allclose(
++            coordinates,
++            np.cos(omega * times)[:, None, None] * modal_pattern,
++            atol=1e-15,
++        )
++        np.testing.assert_allclose(
++            qdot,
++            -omega * np.sin(omega * times)[:, None, None] * modal_pattern,
++            atol=1e-15,
++        )
++
++    def test_lazy_batch_invariance_and_mass_fallback(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "backing"
++            path.touch()
++            reads = []
++
++            def reader(path, offset):
++                reads.append(offset)
++                return self.frames[offset]
++
++            trajectory = Trajectory(path, range(5), reader)
++            for batch_size in (1, 2, 10):
++                reads.clear()
++                result = project_displacements(
++                    trajectory,
++                    self.reference,
++                    self.modes,
++                    batch_size=batch_size,
++                    return_complex=True,
++                )
++                self.assertEqual(reads, list(range(5)))
++                np.testing.assert_allclose(result[4], self.expected, atol=1e-15)
++        self.reference.masses = None
++        np.testing.assert_allclose(
++            self.project(return_complex=True)[4], self.expected, atol=1e-15
++        )
++
++    def test_legacy_file_input(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "modes.evec"
++            lines = [
++                "# Lattice vectors",
++                *[" ".join(map(str, row)) for row in np.eye(3) / BOHR_TO_ANGSTROM],
++                "# Number of phonon modes: 3",
++                "# Number of k points : 4",
++            ]
++            for iq, q in enumerate(self.q):
++                lines.append(f"## kpoint {iq + 1} : " + " ".join(map(str, q)))
++                for im, e in enumerate(self.e[iq]):
++                    lines.append(f"### mode {im + 1} : 0")
++                    lines.extend(f"{z.real} {z.imag}" for z in e.ravel())
++            path.write_text("\n".join(lines))
++            result = project_displacements(
++                self.frames, self.reference, path, return_complex=True
++            )
++            np.testing.assert_allclose(result[4], self.expected, atol=1e-15)
++
++    def test_input_validation(self):
++        with self.assertRaisesRegex(ValueError, "position_mode"):
++            self.project(position_mode="auto")
++        with self.assertRaisesRegex(ValueError, "unwrapped_positions"):
++            self.project(position_mode="unwrapped")
++        with self.assertRaises(ValueError):
++            self.project(batch_size=0)
++        with self.assertRaisesRegex(ValueError, "No trajectory"):
++            project_displacements([], self.reference, self.modes)
++        self.frames[0].cell[0, 0] += 0.01
++        with self.assertRaisesRegex(ValueError, "fixed reference cell"):
++            self.project()
++        self.frames[0].cell = self.reference.cell.copy()
++        self.frames[0].symbols[0] = "He"
++        with self.assertRaisesRegex(ValueError, "atom order"):
++            self.project()
++        self.frames[0].symbols = self.reference.symbols.copy()
++        self.frames[0].positions[0, 0] = np.nan
++        with self.assertRaisesRegex(ValueError, "positions must be finite"):
++            self.project()
++        self.frames[0].positions = np.zeros((3, 3))
++        with self.assertRaisesRegex(ValueError, "shape"):
++            self.project()
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_mode_projection.py b/tests/test_mode_projection.py
+new file mode 100644
+index 0000000..bf144f5
+--- /dev/null
++++ b/tests/test_mode_projection.py
+@@ -0,0 +1,76 @@
++"""Internal projection engine contracts, independent of vector input kind."""
++
++import unittest
++
++import numpy as np
++from numba.core.registry import CPUDispatcher
++
++from isse import (
++    PhononModes,
++    calculate_temperature,
++    project_displacements,
++    project_velocities,
++)
++from isse.helpers.mode_projection import _project_batch_numba, _project_vectors
++from isse.structures import Atoms
++
++
++class ModeProjectionTests(unittest.TestCase):
++    def setUp(self):
++        self.reference = Atoms(
++            symbols=["H"],
++            cell=np.eye(3),
++            positions=np.zeros((1, 3)),
++            masses=np.array([4.0]),
++        )
++        self.modes = PhononModes(
++            self.reference,
++            [[0.0, 0.0, 0.0]],
++            np.zeros((1, 3)),
++            (1j * np.eye(3)).reshape(1, 3, 1, 3),
++        )
++
++    def test_required_vector_iterator_and_generic_values(self):
++        with self.assertRaisesRegex(TypeError, "vector_batches"):
++            _project_vectors([self.reference], self.reference, modes=self.modes)
++        # The frame has neither velocities nor any displacement: only the
++        # caller-supplied vector batch defines what is projected.
++        vectors = np.array([[[1.0, 2.0, 3.0]]])
++        result = _project_vectors(
++            [self.reference],
++            self.reference,
++            modes=self.modes,
++            vector_batches=iter([vectors]),
++            return_complex=True,
++        )
++        np.testing.assert_allclose(result[4][0, 0], [-2j, -4j, -6j])
++        np.testing.assert_allclose(result[1][0, 0], [4, 16, 36])
++        np.testing.assert_allclose(result[2], [56])
++        np.testing.assert_allclose(result[3], [0])
++        self.assertIsInstance(_project_batch_numba, CPUDispatcher)
++        self.assertTrue(_project_batch_numba.nopython_signatures)
++
++    def test_both_workflows_import_shared_engine(self):
++        self.assertIs(
++            project_velocities.__globals__["_project_vectors"], _project_vectors
++        )
++        self.assertIs(
++            project_displacements.__globals__["_project_vectors"], _project_vectors
++        )
++        self.assertEqual(_project_vectors.__module__, "isse.helpers.mode_projection")
++
++    def test_no_backend_selection_or_fallback(self):
++        for workflow in (
++            project_velocities,
++            project_displacements,
++            calculate_temperature,
++        ):
++            for backend in ("numpy", "numba"):
++                with self.assertRaisesRegex(TypeError, "backend"):
++                    workflow(
++                        [self.reference], self.reference, self.modes, backend=backend
++                    )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_phonon_projection.py b/tests/test_phonon_projection.py
+new file mode 100644
+index 0000000..e52b96f
+--- /dev/null
++++ b/tests/test_phonon_projection.py
+@@ -0,0 +1,309 @@
++"""Analytic projection regressions; no ALAMODE calculation is run."""
++
++import tempfile
++import unittest
++from copy import deepcopy
++from pathlib import Path
++from unittest.mock import Mock
++
++import numpy as np
++
++from isse import PhononModes, calculate_temperature, project_velocities
++from isse.constants import BOHR_TO_ANGSTROM
++from isse.io.parse_alamode import read_alamode_evec
++from isse.structures import Atoms, Trajectory
++
++
++class ProjectionTests(unittest.TestCase):
++    def setUp(self):
++        self.primitive = Atoms(
++            symbols=["H"],
++            positions=np.zeros((1, 3)),
++            cell=np.eye(3),
++            masses=np.array([4.0]),
++        )
++        self.q = np.array([[i / 4, 0, 0] for i in range(4)])
++        # Non-real eigenvectors test conjugation separately from spatial phases.
++        self.e = np.broadcast_to(
++            1j * np.eye(3).reshape(1, 3, 1, 3), (4, 3, 1, 3)
++        ).copy()
++        self.modes = PhononModes(self.primitive, self.q, np.ones((4, 3)), self.e)
++        self.reference = Atoms(
++            symbols=["H"] * 4,
++            cell=np.diag([4.0, 1.0, 1.0]),
++            positions=np.array([[i, 0, 0] for i in range(4)], dtype=float),
++            masses=np.full(4, 4.0),
++        )
++        self.velocities = np.arange(60, dtype=float).reshape(5, 4, 3) / 17
++        self.frames = [
++            Atoms(
++                symbols=self.reference.symbols,
++                cell=self.reference.cell,
++                positions=self.reference.positions,
++                masses=self.reference.masses,
++                velocities=v,
++            )
++            for v in self.velocities
++        ]
++
++    def project(self, **kwargs):
++        return project_velocities(
++            self.frames, self.reference, modes=self.modes, **kwargs
++        )
++
++    def test_analytic_complex_and_parseval(self):
++        expected = -1j * np.einsum(
++            "ql,tla->tqa",
++            np.exp(-2j * np.pi * self.q[:, :1] * np.arange(4)),
++            self.velocities,
++        )
++        r = self.project(batch_size=2, return_complex=True)
++        np.testing.assert_allclose(r[4], expected, atol=1e-13)
++        np.testing.assert_allclose(r[1], np.abs(r[4]) ** 2, atol=1e-12)
++        np.testing.assert_allclose(r[1].sum(axis=(1, 2)), r[2], atol=1e-11)
++        np.testing.assert_allclose(r[3], 0, atol=1e-14)
++        self.assertEqual(len(self.project()), 4)
++
++    def test_lazy_trajectory_batch_invariance(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "backing"
++            path.touch()
++            reads = []
++
++            def reader(path, offset):
++                reads.append(offset)
++                return self.frames[offset]
++
++            trajectory = Trajectory(path, list(range(len(self.frames))), reader)
++            self.assertEqual(reads, [])
++            for batch_size in (1, 2, 10):
++                reads.clear()
++                actual = project_velocities(
++                    trajectory,
++                    self.reference,
++                    self.modes,
++                    batch_size=batch_size,
++                    return_complex=True,
++                )
++                self.assertEqual(reads, list(range(len(self.frames))))
++                expected = self.project(return_complex=True)
++                for a, b in zip(actual, expected):
++                    np.testing.assert_allclose(a, b, atol=1e-12)
++
++    def test_gamma_partial_no_renormalization(self):
++        gamma = PhononModes(self.primitive, self.q[:1], np.ones((1, 3)), self.e[:1])
++        r = project_velocities(
++            self.frames,
++            self.reference,
++            gamma,
++            parseval_tolerance=None,
++            return_complex=True,
++        )
++        np.testing.assert_allclose(r[4][:, 0], -1j * self.velocities.sum(axis=1))
++        self.assertTrue(np.all(r[1].sum(axis=(1, 2)) < r[2]))
++        with self.assertRaisesRegex(ValueError, "Incomplete basis"):
++            project_velocities(self.frames, self.reference, gamma)
++        partial_mode = PhononModes(
++            self.primitive, self.q[:1], np.ones((1, 1)), self.e[:1, :1]
++        )
++        r = project_velocities(
++            self.frames, self.reference, partial_mode, parseval_tolerance=None
++        )
++        self.assertEqual(r[1].shape, (5, 1, 1))
++
++    def write_evec(self, path):
++        lines = [
++            "# Lattice vectors",
++            *[" ".join(map(str, row)) for row in np.eye(3) / BOHR_TO_ANGSTROM],
++            "# Number of phonon modes: 3",
++            "# Number of k points : 4",
++        ]
++        for iq, q in enumerate(self.q):
++            lines.append(f"## kpoint {iq + 1} : " + " ".join(map(str, q)))
++            for im, e in enumerate(self.e[iq]):
++                lines.append(f"### mode {im + 1} : {(-1 if im == 0 else 1) * 1e-6}")
++                lines.extend(f"{z.real} {z.imag}" for z in e.ravel())
++        path.write_text("\n".join(lines) + "\n")
++
++    def test_legacy_and_explicit_evec_equivalence(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "modes.evec"
++            self.write_evec(path)
++            modes = PhononModes.from_evec(path, primitive=self.primitive)
++            self.assertAlmostEqual(modes.frequencies[0, 0], -109.7373156816)
++            expected = self.project(return_complex=True)
++            explicit = project_velocities(
++                self.frames, self.reference, modes, return_complex=True
++            )
++            # Exercise the historical spglib mapping on this unambiguous basis.
++            legacy = project_velocities(
++                self.frames, self.reference, str(path), 2, 1e-6, return_complex=True
++            )
++            default_legacy = project_velocities(
++                self.frames, self.reference, evec_filepath=path
++            )
++            self.assertEqual(len(default_legacy), 4)
++            for a, b in zip(default_legacy, expected[:4]):
++                np.testing.assert_allclose(a, b, atol=1e-12)
++            for result in (explicit, legacy):
++                for a, b in zip(result, expected):
++                    np.testing.assert_allclose(a, b, atol=1e-12)
++            path.write_text(path.read_text().rsplit("### mode", 1)[0])
++            with self.assertRaisesRegex(ValueError, "Incomplete mode"):
++                read_alamode_evec(path)
++
++    def test_anphon_adapter_contract(self):
++        ph = Mock()
++        ph.frequencies.return_value = (np.ones((4, 3)), self.e.reshape(4, 3, 3))
++        with self.assertRaisesRegex(ValueError, "Confirm"):
++            PhononModes.from_anphon(ph, self.q, primitive=self.primitive)
++        ph.frequencies.assert_not_called()
++        modes = PhononModes.from_anphon(
++            ph, self.q, primitive=self.primitive, source_order_confirmed=True
++        )
++        np.testing.assert_array_equal(ph.frequencies.call_args.args[0], self.q)
++        self.assertEqual(ph.frequencies.call_args.kwargs, {"eigenvectors": True})
++        np.testing.assert_array_equal(modes.eigenvectors, self.e)
++        ph.frequencies.return_value = (np.ones((4, 3)), np.zeros((4, 1, 3, 3)))
++        with self.assertRaisesRegex(ValueError, "anphon eigenvectors"):
++            PhononModes.from_anphon(
++                ph, self.q, primitive=self.primitive, source_order_confirmed=True
++            )
++
++    def test_shape_normalization_masses_validation(self):
++        for e in (self.e[..., :2], self.e * 2, np.zeros_like(self.e), self.e * np.nan):
++            with self.assertRaises(ValueError):
++                PhononModes(self.primitive, self.q, np.ones((4, 3)), e)
++        e = self.e.copy()
++        e[:, 1] = e[:, 0]
++        with self.assertRaisesRegex(ValueError, "orthonormal"):
++            PhononModes(self.primitive, self.q, np.ones((4, 3)), e)
++        bad = deepcopy(self.primitive)
++        bad.masses = np.array([-1.0])
++        with self.assertRaisesRegex(ValueError, "masses"):
++            PhononModes(bad, self.q, np.ones((4, 3)), self.e)
++        self.reference.masses[0] = 5
++        with self.assertRaisesRegex(ValueError, "Mapped masses"):
++            self.project()
++
++    def test_primitive_requires_explicit_masses(self):
++        primitive = deepcopy(self.primitive)
++        primitive.masses = None
++        with self.assertRaisesRegex(ValueError, "explicit atomic masses"):
++            PhononModes(primitive, self.q, np.ones((4, 3)), self.e)
++        with self.assertRaisesRegex(TypeError, "isse.structures.Atoms"):
++            PhononModes(object(), self.q, np.ones((4, 3)), self.e)
++
++    def test_constructor_copies_inputs(self):
++        self.primitive.positions[:] = 7
++        self.primitive.cell[:] = 8
++        self.primitive.masses[:] = 9
++        self.primitive.symbols[0] = "He"
++        self.q[:] = 2
++        self.e[:] = 0
++        np.testing.assert_array_equal(self.modes.primitive.positions, np.zeros((1, 3)))
++        np.testing.assert_array_equal(self.modes.primitive.cell, np.eye(3))
++        np.testing.assert_array_equal(self.modes.primitive.masses, [4.0])
++        self.assertEqual(self.modes.primitive.symbols, ["H"])
++        np.testing.assert_array_equal(self.modes.qpoints[:, 0], np.arange(4) / 4)
++        self.assertTrue(np.any(self.modes.eigenvectors != 0))
++
++    def test_primitive_images_are_not_wrapped(self):
++        primitive = deepcopy(self.primitive)
++        primitive.positions[0, 0] += 1.0
++        modes = PhononModes(primitive, self.q, np.ones((4, 3)), self.e)
++        original = self.project(return_complex=True)
++        shifted = project_velocities(
++            self.frames,
++            self.reference,
++            modes,
++            return_complex=True,
++        )
++        expected_phase = np.exp(2j * np.pi * self.q[:, 0])[None, :, None]
++        np.testing.assert_allclose(shifted[4], original[4] * expected_phase, atol=1e-12)
++        np.testing.assert_allclose(shifted[1], original[1], atol=1e-12)
++
++    def test_explicit_multiatom_order(self):
++        # Intentionally opposite to the trajectory order, with distinct species.
++        primitive = Atoms(
++            symbols=["He", "H"],
++            positions=np.array([[0.4, 0.2, 0], [0, 0, 0]]),
++            cell=np.eye(3),
++            masses=np.array([4.0, 1.0]),
++        )
++        e = np.eye(6).reshape(1, 6, 2, 3).astype(complex)
++        modes = PhononModes(primitive, [[0, 0, 0]], np.ones((1, 6)), e)
++        ref = Atoms(
++            symbols=["H", "He"],
++            cell=np.eye(3),
++            positions=np.array([[0.0, 0, 0], [0.4, 0.2, 0]]),
++            masses=np.array([1.0, 4.0]),
++            velocities=np.array([[1.0, 2, 3], [4.0, 5, 6]]),
++        )
++        r = project_velocities([ref], ref, modes, return_complex=True)
++        np.testing.assert_allclose(r[4][0, 0], [8, 10, 12, 1, 2, 3])
++        ref.symbols = ["He", "H"]
++        with self.assertRaisesRegex(ValueError, "Mapped species"):
++            project_velocities([ref], ref, modes)
++
++    def test_mapping_validation(self):
++        self.reference.positions[0, 0] = 0.1
++        with self.assertRaisesRegex(ValueError, "mapping"):
++            self.project()
++        self.reference.positions[0, 0] = 1
++        with self.assertRaisesRegex(ValueError, "Duplicate"):
++            self.project()
++
++    def test_noncommensurate_and_duplicate_q(self):
++        for q in (self.q + [0.01, 0, 0], np.zeros_like(self.q)):
++            modes = PhononModes(self.primitive, q, np.ones((4, 3)), self.e)
++            with self.assertRaises(ValueError):
++                project_velocities(self.frames, self.reference, modes)
++
++    def test_mass_fallback_zero_and_empty(self):
++        self.reference.masses = None
++        self.project()
++        self.frames[0].velocities[:] = 0
++        r = self.project()
++        self.assertTrue(np.isnan(r[3][0]))
++        with self.assertRaisesRegex(ValueError, "No trajectory"):
++            project_velocities([], self.reference, self.modes)
++
++    def test_parseval_rejects_incomplete_legacy(self):
++        with tempfile.TemporaryDirectory() as d:
++            path = Path(d) / "modes.evec"
++            self.write_evec(path)
++            # A normalized but incomplete legacy Gamma-only basis retains
++            # the historical RuntimeError unless validation is disabled.
++            text = path.read_text().split("## kpoint 2")[0]
++            path.write_text(text.replace("k points : 4", "k points : 1"))
++            with self.assertRaisesRegex(RuntimeError, "Parseval error"):
++                project_velocities(self.frames, self.reference, path)
++            r = project_velocities(
++                self.frames, self.reference, path, parseval_tolerance=None
++            )
++            self.assertEqual(r[1].shape, (5, 1, 3))
++
++    def test_input_errors(self):
++        with self.assertRaises(ValueError):
++            self.project(batch_size=0)
++        with self.assertRaises(TypeError):
++            self.project(backend="numpy")
++        with self.assertRaises(ValueError):
++            project_velocities(
++                self.frames, self.reference, self.modes, modes=self.modes
++            )
++        with self.assertRaises(ValueError):
++            project_velocities(self.frames, self.reference)
++        self.frames[0].velocities = None
++        with self.assertRaisesRegex(ValueError, "does not contain velocities"):
++            self.project()
++
++    def test_temperature_interface(self):
++        a = calculate_temperature(self.frames, self.reference, modes=self.modes)
++        b = calculate_temperature(self.frames, self.reference, self.modes)
++        np.testing.assert_allclose(a["mode_temperatures"], b["mode_temperatures"])
++
++
++if __name__ == "__main__":
++    unittest.main()

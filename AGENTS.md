@@ -276,9 +276,10 @@ Contratti:
 
 Responsabilità (API interna, non riesportata da `helpers/__init__.py`):
 - `_project_vectors(..., *, vector_batches, modes=None, return_complex=False)`: mapping, masse, coefficienti, orchestrazione batch e Parseval. L'iteratore di vettori cartesiani è obbligatorio; nessuna lettura implicita di velocità/spostamenti dalla trajectory.
-- `_precompute_coefficients(...)`, `_compute_parseval_errors(squared_moduli, atomic_norms)` e `_project_batch_numba(...)` condivisi dai workflow.
+- `_iter_validated_frames(trajectory, reference_atoms)`: validazione metadata comune a entrambi i reader, per ogni frame: sequenza specie, cella finita uguale alla reference (atol=1e-8 Å, rtol=0), masse opzionali finite/positive e coerenti con masse reference/primo frame (atol=rtol=1e-6). Nessun requisito di metadata masse ridondanti. Permutazioni di atomi dello stesso elemento non rilevabili: identità/ordine devono essere preservati dal chiamante.
+- `_precompute_coefficients(...)`, `_compute_parseval_errors(squared_moduli, atomic_norms)` e `_project_batch_numba(...)` condivisi dai workflow. Risultati/norme/errori non finiti causano RuntimeError anche con Parseval disabilitato; NaN intenzionale solo per norma atomica zero e norma modale zero.
 - Nomi generici (`vectors`, `modal_values`, `squared_moduli`); unità determinate dai vettori forniti. Numba obbligatorio, nessun kernel NumPy o fallback, nessun parametro `backend`.
-- Test architetturali in `tests/test_mode_projection.py` e regressioni analitiche nei test dei workflow.
+- Test architetturali in `tests/test_mode_projection.py`, regressioni di validazione/temperature parziali/overflow in `tests/test_projection_validation.py` e regressioni analitiche nei test dei workflow.
 
 ### `project_velocities.py`
 
@@ -320,7 +321,7 @@ API:
 Responsabilità:
 - Usa `project_velocities`.
 - Calcola temperature modali e temperatura ricostruita.
-- Esclude i primi 3 modi a Gamma dalla media termica (`thermal_mask[0, :3] = False`).
+- Esclude i primi 3 modi a Gamma dalla media termica solo per liste di modi complete per q (assunzione legacy acoustic-first). Con liste parziali `PhononModes`, mantiene tutti i modi forniti e logga un warning se Gamma è presente: nessuna esclusione silenziosa di modi ottici.
 
 Note attuali:
 - Calcola `reconstructed_temperature`, ma non la restituisce.

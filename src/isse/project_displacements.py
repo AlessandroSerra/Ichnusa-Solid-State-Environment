@@ -9,7 +9,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from .helpers.mode_projection import _project_vectors
+from .helpers.mode_projection import _iter_validated_frames, _project_vectors
 from .helpers.periodic import minimum_image_displacements
 from .phonon_modes import PhononModes
 from .structures import Atoms, Trajectory
@@ -37,18 +37,7 @@ def _iter_displacement_batches(
         raise ValueError("Reference positions must be finite with shape (natoms, 3)")
 
     batch: list[NDArray[np.float64]] = []
-    for iframe, atoms in enumerate(trajectory):
-        if atoms.symbols != reference_atoms.symbols:
-            raise ValueError(
-                f"Trajectory frame {iframe} symbols must match reference atom order"
-            )
-        cell = np.asarray(atoms.cell, dtype=np.float64)
-        if cell.shape != (3, 3) or not np.allclose(
-            cell, reference_cell, atol=1e-8, rtol=0
-        ):
-            raise ValueError(
-                f"Trajectory frame {iframe} cell differs from the fixed reference cell"
-            )
+    for iframe, atoms in enumerate(_iter_validated_frames(trajectory, reference_atoms)):
         positions = (
             atoms.unwrapped_positions
             if position_mode == "unwrapped"
@@ -99,6 +88,9 @@ def project_displacements(
     trajectory : Trajectory or sequence of Atoms
         Frames in reference atom order. Velocities are not required. Positions
         are in Å; each frame's cell must equal the reference cell to 1e-8 Å.
+        Species checks cannot detect permutations of same-element atoms.
+        Frame masses are optional; if present they must match projection
+        masses (absolute/relative tolerances 1e-6).
     reference_atoms : Atoms
         Fixed equilibrium supercell used for both atomic mapping and the
         displacement origin. Masses (amu) are taken from this structure, or
@@ -144,7 +136,8 @@ def project_displacements(
     parseval_errors : numpy.ndarray
         Relative norm difference, shape (nframes,). NaN for zero displacement
         norms; a completeness deficit rather than a validation error for
-        partial bases with validation disabled.
+        partial bases with validation disabled. Non-finite numerical results
+        raise RuntimeError even when completeness validation is disabled.
     Q : numpy.ndarray, optional
         Only with return_complex=True: complex128 normal coordinates, shape
         (nframes, nq, nmodes), in sqrt(amu) Å.
@@ -162,15 +155,6 @@ def project_displacements(
     if position_mode not in ("minimum_image", "unwrapped", "cartesian"):
         raise ValueError(
             "position_mode must be 'minimum_image', 'unwrapped' or 'cartesian'"
-        )
-    cell = np.asarray(reference_atoms.cell, dtype=np.float64)
-    if (
-        cell.shape != (3, 3)
-        or not np.isfinite(cell).all()
-        or abs(np.linalg.det(cell)) < 1e-12
-    ):
-        raise ValueError(
-            "Reference cell must be finite and nonsingular with shape (3, 3)"
         )
     return _project_vectors(
         trajectory,

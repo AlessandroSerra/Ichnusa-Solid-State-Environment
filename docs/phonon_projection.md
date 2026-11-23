@@ -49,6 +49,22 @@ absence of duplicate sites modulo supercell translations. Trajectory atoms
 must remain in reference order, with velocities in Å/fs. The reference must
 be the equilibrium structure, not a thermally distorted MD frame.
 
+Both projection workflows validate **every frame** before batching: its species
+sequence must match the reference, and its finite simulation cell must agree
+within 1e-8 Å absolute tolerance (no relative tolerance). Variable-cell
+trajectories must be transformed explicitly before either projection.
+Projection masses come from the reference or, if absent there, from the first
+frame. Later frame mass metadata is optional, but every supplied mass array
+must be finite, positive, correctly shaped and agree with projection masses
+within absolute and relative tolerances of 1e-6. You do not need masses in both
+the reference and every frame.
+
+**Species checks cannot detect permutations between atoms of the same chemical
+element.** Matching symbols, masses, or Parseval norms do not establish atomic
+identity. The caller must preserve reference atom identities/order throughout
+the trajectory (for example by maintaining a stable atom-ID ordering). No
+reordering is inferred or performed.
+
 ## Legacy `.evec` files
 
 Existing positional and keyword calls and the default four outputs are unchanged:
@@ -170,6 +186,14 @@ frame. For partial q/mode selections, including Gamma-only in a supercell,
 Noncommensurate projections can also be explicitly requested with validation
 disabled, but do not form a periodic-supercell normal-mode decomposition.
 
+Disabling Parseval tolerance disables only the completeness/equality test,
+**not numerical-integrity checks**. Non-finite squared moduli, atomic norms,
+requested complex amplitudes, summed norms or nonzero-frame relative errors
+raise `RuntimeError`, including overflow from finite inputs. A NaN Parseval
+error is intentional only for a finite zero atomic norm with zero modal norm;
+such frames are excluded from the maximum relative error. All-zero batches
+are valid and keep their NaN error convention.
+
 Half the squared modal velocity, multiplied by `AMU_A2_FS2_TO_EV`, is a modal
 **kinetic** energy in eV. It is not the total harmonic energy: velocity
 projection alone does not compute normal coordinates or potential energies.
@@ -178,8 +202,13 @@ not compute energies automatically. `calculate_temperature` also
 accepts `modes=` with the same Parseval controls. It converts
 mean squared velocities to kinetic-equivalent temperatures; a partial basis
 must not be interpreted as a reconstructed system temperature. Its thermal
-average assumes the first three modes at Gamma are acoustic, as in the legacy
-workflow; do not use that average for arbitrary mode-index subsets.
+average retains the legacy acoustic-first assumption **only for complete
+per-q mode lists** (`3*nprim` modes), excluding the first three entries at
+Gamma. For arbitrary partial mode lists, original acoustic-mode identities
+are unavailable: all supplied modes are retained in `mean_mode_temperature`,
+with a warning if Gamma is present. This avoids silently removing optical
+modes. That partial-set mean is a kinetic-equivalent average of the selected
+modes, not an acoustic-filtered or reconstructed system temperature.
 
 The eigenvector's arbitrary global phase changes individual complex modal
 velocities. Fix the eigenbasis across frames/runs when analyzing coherence.
