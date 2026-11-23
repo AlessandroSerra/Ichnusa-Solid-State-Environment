@@ -149,6 +149,13 @@ Trajectory (positions/unwrapped_positions) + reference Atoms + PhononModes/.evec
               └─ qpoints, |Q|², sum(m|u|²), errori, opzionale Q complesso
 ```
 
+### 5.5 Spostamento quadratico medio (MSD)
+
+```text
+Trajectory → coordinate continue → rimozione COM opzionale → selezione specie
+           → autocorrelazione FFT + somme ai bordi → MSD medio su tutte le origini
+```
+
 ## 6. Moduli e responsabilità
 
 ### `constants.py`
@@ -403,6 +410,13 @@ Contratti/assunzioni:
 - Le unità LAMMPS non hanno default: l'utente deve specificare esplicitamente `input_units`/`output_units` o `units` per evitare assunzioni silenziose.
 - `lammps-data`, POSCAR/VASP sono output single-frame; per input trajectory multi-frame serve `--frame`.
 - Per LAMMPS data, i simboli chimici sono recuperabili in lettura solo passando `symbols`; i test tentano di derivarli dai simboli originali.
+
+### `mean_squared_displacement.py`
+
+- `calculate_msd(trajectory, *, every=1, max_lag=None, species=None, position_mode="auto", remove_com=False)`, disponibile anche da `isse`.
+- MSD in Å² ai lag `0, every, 2*every, ...` fino a `max_lag` incluso, usando tutte le origini disponibili. Se `frame.info["timestep"]` è presente in tutti i frame, restituisce `(lag_time, msd)` nelle unità dei metadata (step di simulazione per dump LAMMPS); se assente da tutti restituisce solo `msd`. Metadata incompleti, non finiti, non crescenti o non equispaziati causano errore.
+- Usa posizioni unwrapped esplicite o ricostruisce immagini da frame consecutivi in cella fissa, con spostamenti frazionari inferiori a mezzo box; non accetta disponibilità mista in modalità `auto`. La rimozione COM opzionale usa le masse dell'intero sistema prima della selezione specie.
+- Legge ogni frame una volta e materializza solo le coordinate selezionate per la FFT. Regressioni: `tests/test_mean_squared_displacement.py`.
 
 ### `spectral.py`
 

@@ -16,6 +16,7 @@ from .constants import (
     symbol_from_mass,
     symbols_from_masses,
 )
+from .mean_squared_displacement import calculate_msd
 from .phonon_modes import PhononModes
 from .phonon_temperatures import calculate_temperature
 from .project_displacements import project_displacements
@@ -37,6 +38,7 @@ __all__ = [
     "KCAL_MOL_TO_EV",
     "PS_TO_FS",
     "PhononModes",
+    "calculate_msd",
     "calculate_rdf",
     "calculate_temperature",
     "calculate_vdos",

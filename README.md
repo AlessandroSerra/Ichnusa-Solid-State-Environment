@@ -15,7 +15,7 @@ The project provides lightweight atomistic data structures, lazy trajectory I/O,
 - Dependency-light conversion utilities without ASE.
 - Phonon velocity/displacement projection and modal temperatures from legacy ALAMODE files, NumPy arrays, or the ALAMODE 2.0 Python API; optional complex modal velocities and normal coordinates.
 - Radial distribution function calculation using Numba.
-- Velocity autocorrelation and vibrational density of states utilities.
+- Mean squared displacement, velocity autocorrelation, and vibrational density of states utilities.
 - Periodic-boundary utilities for wrapping, unwrapping, and minimum-image distances.
 
 ## Installation
@@ -270,6 +270,32 @@ print(partial_rdf["partial_g_r"][("O", "Si")])  # shape (n_frames, n_bins)
 ```
 
 The RDF implementation assumes periodic boundary conditions and returns one RDF per frame for trajectory inputs. Passing a single `Atoms` object returns one-dimensional arrays for that single configuration. RDF histograms are computed with Numba, parallelized over frames.
+
+## Mean squared displacement
+
+```python
+from isse import calculate_msd
+
+# Without timing metadata: just MSD in Å² at frame lags 0, 2, 4, ...
+msd = calculate_msd(untimed_trajectory, every=2)
+
+# With timing metadata: return the lag axis as well.
+lag_time, li_msd = calculate_msd(timed_trajectory, every=2, species="Li", remove_com=True)
+```
+
+`every` sets the output lag interval in frames (default: `1`). MSD still uses
+all available time origins at each reported lag. If frames have `info["timestep"]`
+metadata, ISSE returns `(lag_time, msd)` with a zero-based lag axis in the metadata's
+units. LAMMPS dump timestamps are simulation step numbers, not physical times.
+Timing metadata, when present, must be available for every frame, strictly
+increasing, and uniformly spaced.
+
+By default, ISSE uses explicit unwrapped coordinates if available throughout; otherwise it
+reconstructs them in a fixed, fully periodic cell. Reconstruction requires
+motion of less than half a box in each fractional direction between stored
+frames. Set `position_mode="cartesian"` for already continuous positions stored
+in `positions` or for nonperiodic trajectories. When `remove_com=True`, the
+mass-weighted motion of the whole system is removed before filtering by species.
 
 ## Phonon modal temperatures
 
