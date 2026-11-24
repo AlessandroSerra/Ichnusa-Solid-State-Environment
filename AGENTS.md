@@ -423,7 +423,8 @@ Contratti/assunzioni:
 API:
 - `velocity_autocorrelation(trajectory, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, time_step=None, batch_size=100) -> NDArray | tuple[NDArray, NDArray]`, restituisce `vacf` oppure `(time, vacf)` se `time_step` è fornito
 - `vibrational_density_of_states(data, time_step, atom_groups=None, group=None, max_correlation_len=None, mass_weighted=False, remove_com=True, batch_size=100, gaussian_filter_width=None, method="fft") -> tuple[NDArray, NDArray]`, con `data` = `Trajectory | array VACF | tuple(time, vacf)`; restituisce `(frequency, spectrum)`
-- `calculate_vdos(corr_values, time_step, gaussian_filter_width=None, method="fft") -> tuple[NDArray, NDArray]`
+- `calculate_vdos(corr_values, time_step, gaussian_filter_width=None, method="fft", frequency_step=None, frequency_max=None) -> tuple[NDArray, NDArray]`
+- `vibrational_density_of_states` e `calculate_vdos` accettano `frequency_step`/`frequency_max` keyword-only in cm⁻¹, solo per Filon. Senza opzioni la griglia legacy è invariata; solo step usa massimo Nyquist, solo max usa step legacy. Massimi custom oltre Nyquist rifiutati. Valutazione diretta su griglia indipendente dai campioni, senza migliorare la risoluzione fisica; doc `docs/spectral.md`, regressioni `tests/test_spectral.py`.
 
 Responsabilità:
 - calcolo della velocity autocorrelation function via FFT da sequenze lazy di frame.

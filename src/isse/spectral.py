@@ -114,6 +114,8 @@ def vibrational_density_of_states(
     batch_size: int = 100,
     gaussian_filter_width: float | None = None,
     method: str = "fft",
+    frequency_step: float | None = None,
+    frequency_max: float | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
     Calculate a vibrational spectrum from a trajectory or from a precomputed VACF.
@@ -140,13 +142,56 @@ def vibrational_density_of_states(
     method
         Transform backend. ``"fft"`` is the fast default and scales as
         O(N log N). ``"filon"`` keeps the legacy Filon cosine transform and
-        scales as O(N^2).
+        scales as O(N * M) for N VACF samples and M output frequencies.
+    frequency_step
+        Positive, finite output spacing in cm^-1 (Filon only). If only
+        ``frequency_max`` is supplied, defaults to inverse retained VACF duration.
+    frequency_max
+        Finite, non-negative upper bound in cm^-1 (Filon only). If only
+        ``frequency_step`` is supplied, defaults to Nyquist:
+        ``HZ_TO_CM / (2 * time_step / PS_TO_FS)``. Explicit bounds above
+        Nyquist raise ValueError. The grid starts at zero and stops at the
+        last spacing multiple not exceeding the bound. If both options are
+        None, the legacy grid, including its above-Nyquist range, is unchanged.
+
+    Notes
+    -----
+    Finer Filon spacing directly samples the finite-time cosine transform more
+    densely, without interpolation or padding. It does not improve physical
+    spectral resolution, which is set by VACF duration. Frequencies above
+    Nyquist do not represent independent physical information. Filon retains
+    an even number of intervals, dropping the last VACF point if necessary.
+
+    Examples
+    --------
+    Evaluate a VACF sampled every 0.1 fs on a 50 cm^-1 grid:
+
+    >>> frequency, spectrum = vibrational_density_of_states(
+    ...     np.ones(1000), time_step=0.1, method="filon",
+    ...     frequency_step=50.0, frequency_max=5000.0,
+    ... )
+    >>> frequency.size
+    101
 
     Returns
     -------
     tuple[NDArray[np.float64], NDArray[np.float64]]
         ``(frequency, spectrum)``, with ``frequency`` in cm^-1.
     """
+    method_normalized = method.lower()
+    if method_normalized not in ("fft", "filon"):
+        raise ValueError("method must be 'fft' or 'filon'")
+    if frequency_step is not None:
+        if not np.isfinite(frequency_step) or frequency_step <= 0:
+            raise ValueError("frequency_step must be finite and strictly positive")
+    if frequency_max is not None:
+        if not np.isfinite(frequency_max) or frequency_max < 0:
+            raise ValueError("frequency_max must be finite and non-negative")
+    if method_normalized == "fft" and (
+        frequency_step is not None or frequency_max is not None
+    ):
+        raise ValueError("custom frequency grids require method='filon', not 'fft'")
+
     corr, times = _prepare_vdos_input(
         data,
         time_step=time_step,
@@ -171,20 +216,19 @@ def vibrational_density_of_states(
     corr = corr.copy()
     dt_ps = float(dt) / PS_TO_FS
 
-    method_normalized = method.lower()
     if method_normalized == "fft":
         return _vdos_fft(
             corr,
             dt_ps=dt_ps,
             gaussian_filter_width=gaussian_filter_width,
         )
-    if method_normalized == "filon":
-        return _vdos_filon(
-            corr,
-            dt_ps=dt_ps,
-            gaussian_filter_width=gaussian_filter_width,
-        )
-    raise ValueError("method must be 'fft' or 'filon'")
+    return _vdos_filon(
+        corr,
+        dt_ps=dt_ps,
+        gaussian_filter_width=gaussian_filter_width,
+        frequency_step=frequency_step,
+        frequency_max=frequency_max,
+    )
 
 
 def calculate_vdos(
@@ -193,13 +237,22 @@ def calculate_vdos(
     *,
     gaussian_filter_width: float | None = None,
     method: str = "fft",
+    frequency_step: float | None = None,
+    frequency_max: float | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compatibility wrapper around :func:`vibrational_density_of_states`."""
+    """Compatibility wrapper around :func:`vibrational_density_of_states`.
+
+    ``time_step`` is in fs. Keyword-only ``frequency_step`` and
+    ``frequency_max`` are in cm^-1 and require ``method="filon"``; defaults,
+    Nyquist restrictions and finite-duration resolution are documented there.
+    """
     return vibrational_density_of_states(
         corr_values,
         time_step,
         gaussian_filter_width=gaussian_filter_width,
         method=method,
+        frequency_step=frequency_step,
+        frequency_max=frequency_max,
     )
 
 
@@ -242,6 +295,8 @@ def _vdos_filon(
     *,
     dt_ps: float,
     gaussian_filter_width: float | None,
+    frequency_step: float | None = None,
+    frequency_max: float | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     if dt_ps <= 0:
         raise ValueError("time step must be positive")
@@ -258,6 +313,24 @@ def _vdos_filon(
 
     t_max_ps = float(n_intervals) * dt_ps
     delta_omega = TWO_PI / t_max_ps
+    if frequency_step is None and frequency_max is None:
+        # Preserve the legacy grid, including its above-Nyquist range.
+        angular_frequency = np.arange(n_intervals + 1, dtype=np.float64) * delta_omega
+        frequency = angular_frequency / TWO_PI * HZ_TO_CM
+    else:
+        nyquist_frequency = HZ_TO_CM / (2.0 * dt_ps)
+        if frequency_max is None:
+            frequency_max = nyquist_frequency
+        elif frequency_max > nyquist_frequency:
+            raise ValueError("frequency_max must not exceed the Nyquist frequency")
+        if frequency_step is None:
+            frequency_step = HZ_TO_CM / t_max_ps
+        delta_omega = TWO_PI * frequency_step / HZ_TO_CM
+        # Try one extra multiple to handle division roundoff, then enforce
+        # the requested upper bound on the actual floating-point grid.
+        n_frequencies = int(np.floor(frequency_max / frequency_step)) + 1
+        frequency = np.arange(n_frequencies + 1, dtype=np.float64) * frequency_step
+        frequency = frequency[frequency <= frequency_max]
 
     if gaussian_filter_width is not None:
         if gaussian_filter_width < 0:
@@ -268,7 +341,7 @@ def _vdos_filon(
         )
         corr *= window
 
-    spectrum = np.zeros(n_intervals + 1, dtype=np.float64)
+    spectrum = np.zeros(frequency.size, dtype=np.float64)
     _filon_cosine_transform(
         dt_ps,
         delta_omega,
@@ -277,8 +350,6 @@ def _vdos_filon(
         spectrum,
     )
 
-    angular_frequency = np.arange(n_intervals + 1, dtype=np.float64) * delta_omega
-    frequency = angular_frequency / TWO_PI * HZ_TO_CM
     return frequency, spectrum
 
 
@@ -477,12 +548,9 @@ def _filon_cosine_transform(
         raise ValueError("n_intervals must be even for the Filon transform")
     if corr.shape[0] != n_intervals + 1:
         raise ValueError("corr length must be n_intervals + 1")
-    if out.shape[0] != n_intervals + 1:
-        raise ValueError("out length must be n_intervals + 1")
-
     t_max = float(n_intervals) * dt
 
-    for nu in prange(n_intervals + 1):
+    for nu in prange(out.size):
         omega = float(nu) * delta_omega
         theta = omega * dt
         sin_theta = np.sin(theta)
